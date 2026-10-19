@@ -99,7 +99,7 @@ Every line should start with `[ok]`, ending in `Catalog found. Setup is complete
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add an entry under `mcpServers`, keeping any existing ones. Claude Desktop does not read your shell's `PATH`, so use the absolute path printed by `which lr-mcp`:
+Add an entry under `mcpServers`, keeping any existing ones (if a `lightroom` entry already exists, replace it). Claude Desktop does not read your shell's `PATH`, so use the absolute path printed by `which lr-mcp`:
 
 ```json
 {
@@ -132,6 +132,7 @@ The client config can be added before or after signing in; without tokens the to
 | `doctor`: `rejected the client id` | `ADOBE_CLIENT_ID` is wrong or the tokens belong to another credential. Fix `.env`, then sign in again. |
 | `doctor`: `Lightroom API refused the account` | The signed-in account is not a beta user (step 1.4) or has no Lightroom plan. |
 | The sign-in page says the redirect URI is invalid | The console's redirect URI must be exactly `https://localhost:<port>/callback`, with the same port as `LR_MCP_PORT`. |
+| The sign-in redirect shows another app's page or never loads | Something else listens on the port (`lsof -iTCP:8000 -sTCP:LISTEN`). Use another port as above. |
 | `login` times out after 5 minutes | The browser stopped at the certificate warning; proceed past it next time. |
 | `Token refresh failed` | Run `lr-mcp login` again. |
 | Tools missing in Claude Desktop | Use the absolute path to `lr-mcp`, fully restart the app, and read the log file above. |

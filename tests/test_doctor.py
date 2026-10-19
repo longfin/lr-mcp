@@ -53,3 +53,17 @@ def test_wrong_api_key(monkeypatch):
 def test_not_a_beta_user(monkeypatch):
     ok, msg, fix = results(monkeypatch, 403, {"code": "1003", "description": "Access is forbidden"})[-1]
     assert not ok and "Manage beta users" in fix
+
+
+def test_port_busy_on_ipv6_only():
+    import socket
+    with socket.socket(socket.AF_INET6) as s:
+        s.bind(("::1", 0))
+        s.listen()
+        assert not doctor._port_free(s.getsockname()[1])
+
+
+def test_login_hint_includes_custom_home(monkeypatch):
+    monkeypatch.setattr(doctor, "_port_free", lambda port: True)
+    ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
+    assert f"LR_MCP_HOME={lr.HOME}" in fix or str(lr.HOME) in fix

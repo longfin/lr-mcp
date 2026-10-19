@@ -9,12 +9,26 @@ from .client import LrError
 
 
 def _port_free(port):
+    """`localhost` may resolve to ::1 or 127.0.0.1 in the browser, so a listener on either counts as busy."""
+    for family, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        with socket.socket(family) as s:
+            s.settimeout(0.5)
+            try:
+                s.connect((addr, port))
+                return False
+            except OSError:
+                pass
     with socket.socket() as s:
         try:
             s.bind(("localhost", port))
         except OSError:
             return False
     return True
+
+
+def _login_cmd():
+    home = os.environ.get("LR_MCP_HOME")
+    return f"LR_MCP_HOME={home} lr-mcp login" if home else "lr-mcp login"
 
 
 def checks():
@@ -40,11 +54,12 @@ def checks():
             f"[human] Create an OAuth Web App credential in the Adobe Developer Console (README step 1), "
             f"then put ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET in {lr.HOME / '.env'} (README step 2).")
         return
-    yield True, f"Credentials set (client id {os.environ['ADOBE_CLIENT_ID'][:6]}…)", None
+    cid = os.environ["ADOBE_CLIENT_ID"]
+    yield True, f"Credentials set (client id {cid[:6] + '…' if len(cid) > 12 else 'set'})", None
 
     if not lr.TOKEN_FILE.exists():
         yield False, "Not signed in", (
-            "[human] Run `lr-mcp login` and finish sign-in in the browser "
+            f"[human] Run `{_login_cmd()}` and finish sign-in in the browser "
             "(accept the localhost certificate warning).")
         return
 
@@ -52,7 +67,7 @@ def checks():
         lr.access_token()
     except LrError as e:
         yield False, f"Token refresh failed: {e}", (
-            "[human] Run `lr-mcp login` again. If it keeps failing, check that the client id and "
+            f"[human] Run `{_login_cmd()}` again. If it keeps failing, check that the client id and "
             "secret in .env belong to the credential you signed in with.")
         return
     yield True, f"Signed in (tokens in {lr.TOKEN_FILE})", None
@@ -62,13 +77,13 @@ def checks():
     if status in (401, 403) and "api key" in json.dumps(data).lower():
         yield False, f"Lightroom API rejected the client id ({status}): {json.dumps(data)[:200]}", (
             "ADOBE_CLIENT_ID is wrong, or the tokens were issued for another credential. Fix the id "
-            "in .env (it must be the credential's Client ID / API key), then run `lr-mcp login` again.")
+            f"in .env (it must be the credential's Client ID / API key), then run `{_login_cmd()}` again.")
         return
     if status in (401, 403):
         yield False, f"Lightroom API refused the account ({status}): {json.dumps(data)[:200]}", (
             "[human] In the Adobe console, add the signed-in Adobe account under "
             "Lightroom Services → Manage beta users, and make sure it has a Lightroom plan or trial. "
-            "Then run `lr-mcp login` again.")
+            f"Then run `{_login_cmd()}` again.")
         return
     if status != 200:
         yield False, f"GET /v2/account returned {status}: {json.dumps(data)[:200]}", (
