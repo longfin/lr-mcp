@@ -25,7 +25,8 @@ def test_all_ok(monkeypatch):
 
 def test_missing_credentials(monkeypatch):
     monkeypatch.delenv("ADOBE_CLIENT_SECRET")
-    ok, msg, fix = results(monkeypatch)[-1]
+    monkeypatch.setattr(doctor, "_port_free", lambda port: True)
+    ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
     assert not ok and "ADOBE_CLIENT_SECRET" in msg and fix.startswith("[human]")
 
 
@@ -35,10 +36,13 @@ def test_not_signed_in(monkeypatch):
     assert not ok and msg == "Not signed in" and "lr-mcp login" in fix
 
 
-def test_port_in_use(monkeypatch):
+def test_port_in_use_is_reported_before_credentials(monkeypatch):
+    monkeypatch.delenv("ADOBE_CLIENT_ID")
     monkeypatch.setattr(doctor, "_port_free", lambda port: False)
-    ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
+    out = results(monkeypatch, signed_in=False)
+    ok, msg, fix = out[-1]
     assert not ok and "in use" in msg and "LR_MCP_PORT" in fix
+    assert not any("ADOBE_CLIENT_ID" in m for _, m, _ in out)
 
 
 def test_wrong_api_key(monkeypatch):

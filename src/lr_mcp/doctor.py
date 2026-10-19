@@ -21,6 +21,19 @@ def checks():
     """Yield (ok, message, fix). Stops after the first failure that later checks depend on."""
     yield True, f"State directory: {lr.HOME}", None
 
+    if not lr.TOKEN_FILE.exists():
+        # checked before credentials so a busy port is found before the console is configured
+        if not shutil.which("openssl"):
+            yield False, "openssl not found (needed for the sign-in callback certificate)", (
+                "Install openssl (e.g. `brew install openssl` or your distro's package).")
+            return
+        if not _port_free(lr.PORT):
+            yield False, f"Callback port {lr.PORT} is in use", (
+                f"Pick a free port, put LR_MCP_PORT=<port> in {lr.HOME / '.env'}, and use "
+                "https://localhost:<port>/callback as the redirect URI in the Adobe console.")
+            return
+        yield True, f"Callback port {lr.PORT} is free (redirect URI https://localhost:{lr.PORT}/callback)", None
+
     missing = [k for k in ("ADOBE_CLIENT_ID", "ADOBE_CLIENT_SECRET") if not os.environ.get(k)]
     if missing:
         yield False, f"Not set: {', '.join(missing)}", (
@@ -30,15 +43,6 @@ def checks():
     yield True, f"Credentials set (client id {os.environ['ADOBE_CLIENT_ID'][:6]}…)", None
 
     if not lr.TOKEN_FILE.exists():
-        if not shutil.which("openssl"):
-            yield False, "openssl not found (needed for the sign-in callback certificate)", (
-                "Install openssl (e.g. `brew install openssl` or your distro's package).")
-            return
-        if not _port_free(lr.PORT):
-            yield False, f"Callback port {lr.PORT} is in use", (
-                "Set LR_MCP_PORT to a free port and add https://localhost:<port>/callback "
-                "as a redirect URI in the Adobe console.")
-            return
         yield False, "Not signed in", (
             "[human] Run `lr-mcp login` and finish sign-in in the browser "
             "(accept the localhost certificate warning).")
