@@ -26,81 +26,128 @@ An unofficial MCP server for **Adobe Photoshop Lightroom** — the cloud-based L
 
 ## Setup
 
-### 1. Create an Adobe integration
+Setup takes about ten minutes. Steps marked **[human]** need a person at a browser; an AI agent can do the rest (see [For AI agents](#for-ai-agents)).
 
-Each user needs their own credential. Until Adobe reviews an integration it is limited to 25 beta users, so a shared client ID is not practical.
+### Prerequisites
 
-1. Open the [Adobe Developer Console](https://developer.adobe.com/console) and create a project.
-2. **Add API** → **Lightroom Services** → **OAuth Web App**.
-3. Set the redirect URI to `https://localhost:8000/callback` and the redirect URI pattern to `https://localhost:8000/.*`. Use another port if 8000 is taken, and set `LR_MCP_PORT` to match.
-4. Under **Lightroom Services → Manage beta users**, add the Adobe account you will sign in with.
-5. Copy the **Client ID** and **Client Secret** from the credential page.
+- An Adobe account with a Lightroom plan or trial.
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (`uv --version`). It installs Python 3.12+ itself if needed.
+- `openssl` (`openssl version`). Preinstalled on macOS and most Linux distributions.
 
-The signed-in account needs an active Lightroom subscription or trial.
+The command below is used throughout. Until the package is published on PyPI it installs straight from GitHub:
 
-### 2. Configure
+```bash
+uvx --from git+https://github.com/longfin/lr-mcp lr-mcp <command>
+```
+
+Once `lr-mcp` is on PyPI, `uvx lr-mcp <command>` works too.
+
+### 1. Create an Adobe credential [human]
+
+Each user needs their own credential: until Adobe reviews an integration it accepts only 25 beta users, so a shared client ID is not practical.
+
+1. Sign in to the [Adobe Developer Console](https://developer.adobe.com/console) and click **Create new project**.
+2. In the project, click **Add API**, choose **Lightroom Services**, then pick the **OAuth Web App** credential type.
+3. Set **Default redirect URI** to `https://localhost:8000/callback` and **Redirect URI pattern** to `https://localhost:8000/.*`, then save. (If port 8000 is taken, use another port here and set `LR_MCP_PORT` to match.)
+4. Open **Lightroom Services** in the project's left menu, click **Manage beta users**, and add the email of the Adobe account you will sign in with. Without this, the API refuses the account.
+5. Open **Credentials → OAuth Web App** and keep the **Client ID** and **Client Secret** at hand for step 2.
+
+### 2. Save the credential
 
 Settings come from environment variables, or from a `.env` file in the state directory (`~/.config/lr-mcp/` by default):
 
 | Variable | Required | Description |
 |---|---|---|
-| `ADOBE_CLIENT_ID` | yes | Client ID (API key) |
+| `ADOBE_CLIENT_ID` | yes | Client ID (also called API key) |
 | `ADOBE_CLIENT_SECRET` | yes | Client secret |
 | `LR_MCP_PORT` | no | Local callback port, default `8000` |
 | `LR_MCP_HOME` | no | State directory, default `$XDG_CONFIG_HOME/lr-mcp` or `~/.config/lr-mcp` |
 
+Create the file, then open it in an editor and paste the two values after the `=` signs:
+
 ```bash
 mkdir -p ~/.config/lr-mcp
-cat > ~/.config/lr-mcp/.env <<'EOF'
-ADOBE_CLIENT_ID=your-client-id
-ADOBE_CLIENT_SECRET=your-client-secret
-EOF
+printf 'ADOBE_CLIENT_ID=\nADOBE_CLIENT_SECRET=\n' > ~/.config/lr-mcp/.env
 chmod 600 ~/.config/lr-mcp/.env
 ```
 
-### 3. Sign in
+### 3. Sign in [human]
 
 ```bash
-uvx lr-mcp login
+uvx --from git+https://github.com/longfin/lr-mcp lr-mcp login
 ```
 
-A browser window opens. The local callback server uses a self-signed certificate (created with `openssl`), so the browser shows a certificate warning for `localhost`; proceed past it. Tokens are stored in the state directory with mode 600 and refreshed automatically.
+A browser window opens on the Adobe sign-in page. Sign in with the account added as a beta user and allow access. Adobe then redirects to `https://localhost:8000/callback`, which uses a self-signed certificate, so the browser shows a certificate warning: choose **Advanced → Proceed to localhost** (Chrome) or **Show Details → visit this website** (Safari). The page then says "Signed in" and the terminal prints where the tokens were saved. Tokens are stored with mode 600 and refreshed automatically.
 
-You can also skip this step and ask the assistant to run `lr_login`.
+### 4. Check
 
-### 4. Add to your MCP client
+```bash
+uvx --from git+https://github.com/longfin/lr-mcp lr-mcp doctor
+```
 
-Claude Desktop (`claude_desktop_config.json`):
+`doctor` checks each step in order. Every line should start with `[ok]`, ending in `Catalog found. Setup is complete.` Otherwise it prints a `fix:` for the first problem and exits with status 1.
+
+### 5. Add to your MCP client
+
+**Claude Desktop.** Edit the config file (create it if missing):
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Add an entry under `mcpServers`, keeping any existing ones:
 
 ```json
 {
   "mcpServers": {
     "lightroom": {
       "command": "uvx",
-      "args": ["lr-mcp"]
+      "args": ["--from", "git+https://github.com/longfin/lr-mcp", "lr-mcp"]
     }
   }
 }
 ```
 
-Claude Desktop does not always see your shell's `PATH`; if `uvx` is not found, use its absolute path (`which uvx`). You can also pass `ADOBE_CLIENT_ID` and `ADOBE_CLIENT_SECRET` in an `"env"` block instead of the `.env` file.
+Claude Desktop does not read your shell's `PATH`, so if the server fails to start, replace `"uvx"` with the absolute path printed by `which uvx` (often `/Users/<you>/.local/bin/uvx`). Quit Claude Desktop completely and reopen it; the `lr_*` tools then appear in the tools menu. On macOS the server log is `~/Library/Logs/Claude/mcp-server-lightroom.log`.
 
-Claude Code:
+**Claude Code:**
 
 ```bash
-claude mcp add lightroom -s user -- uvx lr-mcp
+claude mcp add lightroom -s user -- uvx --from git+https://github.com/longfin/lr-mcp lr-mcp
 ```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `doctor`: `Not set: ADOBE_CLIENT_ID…` | Step 2: fill in `~/.config/lr-mcp/.env`. |
+| `doctor`: `rejected the client id` | `ADOBE_CLIENT_ID` is wrong or the tokens belong to another credential. Fix `.env`, then sign in again. |
+| `doctor`: `Lightroom API refused the account` | The signed-in account is not a beta user (step 1.4) or has no Lightroom plan. |
+| The sign-in page says the redirect URI is invalid | The console's redirect URI must be exactly `https://localhost:<port>/callback`, with the same port as `LR_MCP_PORT`. |
+| `login`: `Cannot listen on localhost:8000` | Another program uses the port. Pick another port in the console and in `LR_MCP_PORT`. |
+| `login` times out after 5 minutes | The browser stopped at the certificate warning; proceed past it next time. |
+| `Token refresh failed` | Run `lr-mcp login` again. |
+| Tools missing in Claude Desktop | Use the absolute path to `uvx`, fully restart the app, and read the log file above. |
+
+## For AI agents
+
+If a user asks you to set this server up:
+
+- **Never ask the user to paste the client secret into the chat.** Create the `.env` file with empty values (step 2) and ask the user to fill it in with an editor. Check that both keys are set without printing their values.
+- Run `lr-mcp doctor` first and again after every step. It reports the first missing step; a `fix:` that starts with `[human]` is something to hand to the user.
+- The user must create the credential, add the beta user, fill in `.env`, and finish the browser sign-in. Give them the exact console steps from step 1, including the redirect URI and pattern.
+- `lr-mcp login` blocks for up to 5 minutes while the user signs in. Run it in the background or ask the user to run it, and warn them about the certificate page.
+- Setup is done when `doctor` prints `Catalog found. Setup is complete.` Then add the client config (step 5). For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path to `uvx`, and tell the user to restart the app.
 
 ## Development
 
 ```bash
-git clone <this repo> && cd lr-mcp
+git clone https://github.com/longfin/lr-mcp && cd lr-mcp
 uv sync
-uv run lr-mcp login
+uv run lr-mcp doctor
 uv run pytest
 ```
 
-To run from a checkout, replace `uvx lr-mcp` with `uv run --directory /path/to/lr-mcp lr-mcp`.
+To run a checkout from an MCP client, use `uv run --directory /path/to/lr-mcp lr-mcp` as the command.
 
 ## License
 

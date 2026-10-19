@@ -2,6 +2,7 @@
 
 `lr-mcp`        run the stdio MCP server
 `lr-mcp login`  sign in from the terminal (opens a browser)
+`lr-mcp doctor` check the setup and say what to fix next
 """
 import asyncio
 import re
@@ -390,6 +391,9 @@ def main():
             sys.exit(str(e))
         print(f"Tokens saved to {lr.TOKEN_FILE} (refresh token: {'yes' if tok.get('refresh_token') else 'no'})")
         return
+    if sys.argv[1:] == ["doctor"]:
+        from .doctor import run
+        sys.exit(0 if run() else 1)
     if sys.argv[1:]:
         sys.exit(__doc__)
     mcp.run()
