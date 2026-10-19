@@ -37,7 +37,7 @@ Setup takes about ten minutes. Steps marked **[human]** need a person at a brows
 ### 0. Install
 
 ```bash
-uv tool install git+https://github.com/longfin/lr-mcp
+uv tool install lr-mcp
 lr-mcp doctor
 ```
 
@@ -156,7 +156,7 @@ uv run lr-mcp doctor
 uv run pytest
 ```
 
-To run a checkout from an MCP client, use `uv run --directory /path/to/lr-mcp lr-mcp` as the command. Without installing, `uvx --from git+https://github.com/longfin/lr-mcp lr-mcp <command>` also works.
+To run a checkout from an MCP client, use `uv run --directory /path/to/lr-mcp lr-mcp` as the command. Without installing, `uvx lr-mcp <command>` also works.
 
 ## License
 
