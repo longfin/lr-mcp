@@ -127,3 +127,49 @@ def test_view_photos_rejects_bad_size():
 def test_download_requires_target():
     with pytest.raises(LrError):
         server.lr_download_photos()
+
+
+def _ids(out):
+    return [line.split(" | ")[0] for line in out.splitlines()[1:]]
+
+
+@pytest.mark.parametrize("hour_from, hour_to, expected", [
+    (19, 4, ["late", "midnight", "dawn"]),  # wraps past midnight
+    (12, 15, ["noon"]),
+    (19, None, ["late"]),
+    (None, 4, ["midnight", "dawn"]),
+])
+def test_list_photos_time_of_day(monkeypatch, hour_from, hour_to, expected):
+    items = [
+        asset("midnight", "2024-05-01T00:30:00"),
+        asset("dawn", "2024-05-01T04:59:00"),
+        asset("morning", "2024-05-01T05:00:00"),
+        asset("noon", "2024-05-01T12:00:00"),
+        asset("late", "2024-05-01T20:15:00"),
+    ]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: ({"asset": a} for a in items))
+    out = server.lr_list_photos(album_id="x", hour_from=hour_from, hour_to=hour_to)
+    assert sorted(_ids(out)) == sorted(expected)
+
+
+def test_list_photos_rejects_bad_hour():
+    with pytest.raises(LrError):
+        server.lr_list_photos(album_id="x", hour_from=24)
+
+
+def test_list_photos_fnumber(monkeypatch):
+    def with_f(aid, f):
+        a = asset(aid, "2024-05-01T12:00:00")
+        if f is None:
+            del a["payload"]["xmp"]["exif"]["FNumber"]
+        else:
+            a["payload"]["xmp"]["exif"]["FNumber"] = f
+        return a
+
+    items = [with_f("f1", [10, 10]), with_f("f2", [2, 1]), with_f("f4", [40, 10]),
+             with_f("f8", [8, 1]), with_f("none", None)]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: ({"asset": a} for a in items))
+    assert _ids(server.lr_list_photos(album_id="x", max_fnumber=2)) == ["f1", "f2"]
+    assert _ids(server.lr_list_photos(album_id="x", min_fnumber=8)) == ["f8"]
+    assert _ids(server.lr_list_photos(album_id="x", min_fnumber=2, max_fnumber=4)) == ["f2", "f4"]
+    assert len(_ids(server.lr_list_photos(album_id="x"))) == 5
