@@ -1,16 +1,24 @@
 [project]
 name = "lr-mcp"
 version = "0.1.0"
-description = "MCP server for the Adobe Lightroom (cloud) Partner API: browse albums, filter and view photos, export renditions"
+description = "Unofficial MCP server for the Adobe Photoshop Lightroom Partner API: browse albums, filter and view photos, export renditions"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Swen Mun" }]
 requires-python = ">=3.12"
 dependencies = ["mcp>=2.3,<3"]
 keywords = ["mcp", "lightroom", "adobe", "photography", "claude"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
     "Topic :: Multimedia :: Graphics",
 ]
+
+[project.urls]
+Repository = "https://github.com/longfin/lr-mcp"
 
 [project.scripts]
 lr-mcp = "lr_mcp.server:main"
@@ -18,3 +26,11 @@ lr-mcp = "lr_mcp.server:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

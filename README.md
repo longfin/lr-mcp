@@ -1,6 +1,8 @@
 # lr-mcp
 
-An MCP server for **Adobe Lightroom (cloud)** — the Lightroom app that syncs to Creative Cloud, not Lightroom Classic. It talks to the [Lightroom Partner API](https://developer.adobe.com/lightroom/lightroom-api-docs/) (`https://lr.adobe.io`) with your own Adobe credentials.
+An unofficial MCP server for **Adobe Photoshop Lightroom** — the cloud-based Lightroom app, not Lightroom Classic. It talks to the [Lightroom Partner API](https://developer.adobe.com/lightroom/lightroom-api-docs/) (`https://lr.adobe.io`) with your own Adobe credentials.
+
+> This project is not affiliated with, endorsed by, or sponsored by Adobe. Adobe, Photoshop and Lightroom are either registered trademarks or trademarks of Adobe in the United States and/or other countries.
 
 ## Tools
 
@@ -95,6 +97,11 @@ claude mcp add lightroom -s user -- uvx lr-mcp
 git clone <this repo> && cd lr-mcp
 uv sync
 uv run lr-mcp login
+uv run pytest
 ```
 
 To run from a checkout, replace `uvx lr-mcp` with `uv run --directory /path/to/lr-mcp lr-mcp`.
+
+## License
+
+[MIT](LICENSE)
