@@ -123,6 +123,21 @@ def _iter_assets(album_id, captured_after, captured_before):
     yield from lr.paginate(lr.catalog_path() + q)
 
 
+def _fnumber(asset):
+    v = _frac(asset.get("payload", {}).get("xmp", {}).get("exif", {}).get("FNumber"))
+    return v if isinstance(v, (int, float)) else None
+
+
+def _in_hours(captured, hour_from, hour_to):
+    """hour_from..hour_to inclusive; wraps past midnight when hour_from > hour_to (e.g. 19..4)."""
+    if not captured or len(captured) < 13:
+        return False
+    h = int(captured[11:13])
+    lo = 0 if hour_from is None else hour_from
+    hi = 23 if hour_to is None else hour_to
+    return lo <= h <= hi if lo <= hi else h >= lo or h <= hi
+
+
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -184,6 +199,10 @@ def lr_list_photos(
     lens: str | None = None,
     min_iso: int | None = None,
     filename: str | None = None,
+    hour_from: int | None = None,
+    hour_to: int | None = None,
+    max_fnumber: float | None = None,
+    min_fnumber: float | None = None,
     limit: int = 100,
 ) -> str:
     """List photos matching filters, oldest capture first.
@@ -192,7 +211,15 @@ def lr_list_photos(
     captured_after / captured_before: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SS'.
     min_rating: minimum star rating (1-5). flag: 'pick' or 'reject'.
     camera / lens / filename: case-insensitive substrings. min_iso: minimum ISO.
+    hour_from / hour_to: time of day in the camera's local capture time, 0-23 inclusive;
+    wraps past midnight when hour_from > hour_to (e.g. 19 and 4 for night shots).
+    max_fnumber / min_fnumber: f-number bounds, e.g. max_fnumber=2 for f/2 or wider,
+    min_fnumber=8 for f/8 or narrower. Useful when lens info is missing (manual lenses).
+    Photos without the needed capture time or f-number are excluded when these are set.
     Each line: id | file | captured | rating | flag | exposure | camera + lens"""
+    for h in (hour_from, hour_to):
+        if h is not None and not 0 <= h <= 23:
+            raise LrError("hour_from and hour_to must be between 0 and 23")
     if captured_after and len(captured_after) == 10:
         captured_after += "T00:00:00"
     if captured_before and len(captured_before) == 10:
@@ -220,6 +247,13 @@ def lr_list_photos(
             continue
         if filename and filename.lower() not in (s["file"] or "").lower():
             continue
+        if (hour_from is not None or hour_to is not None) and not _in_hours(s["captured"], hour_from, hour_to):
+            continue
+        if max_fnumber is not None or min_fnumber is not None:
+            f = _fnumber(a)
+            if f is None or (max_fnumber is not None and f > max_fnumber) \
+                    or (min_fnumber is not None and f < min_fnumber):
+                continue
         out.append(s)
         if len(out) >= limit or scanned >= max_scan:
             break
