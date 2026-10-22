@@ -1,6 +1,6 @@
 [project]
 name = "lr-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial MCP server for the Adobe Photoshop Lightroom Partner API: browse albums, filter and view photos, export renditions"
 readme = "README.md"
 license = "MIT"
