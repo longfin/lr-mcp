@@ -65,11 +65,11 @@ Settings live in a `.env` file in the state directory, which `doctor` prints on 
 | `ADOBE_CLIENT_SECRET` | yes | Client secret |
 | `LR_MCP_PORT` | no | Sign-in callback port, default `8000` |
 
-Create the file, then open it in an editor and paste the two values after the `=` signs (add `LR_MCP_PORT=<port>` if you are not using 8000):
+Create the file, then open it in an editor and paste the two values after the `=` signs (add `LR_MCP_PORT=<port>` if you are not using 8000). The commands below use the default directory; if `doctor` printed a different one, use that instead. An existing `.env` is left untouched:
 
 ```bash
 mkdir -p ~/.config/lr-mcp
-printf 'ADOBE_CLIENT_ID=\nADOBE_CLIENT_SECRET=\n' > ~/.config/lr-mcp/.env
+[ -f ~/.config/lr-mcp/.env ] || printf 'ADOBE_CLIENT_ID=\nADOBE_CLIENT_SECRET=\n' > ~/.config/lr-mcp/.env
 chmod 600 ~/.config/lr-mcp/.env
 open -e ~/.config/lr-mcp/.env      # macOS; on Linux use any editor, e.g. nano
 ```
@@ -116,8 +116,10 @@ If you set `LR_MCP_HOME`, add `"env": {"LR_MCP_HOME": "/path/to/dir"}` to the en
 **Claude Code:**
 
 ```bash
-claude mcp add lightroom -s user -- lr-mcp
+claude mcp add lightroom -s user -- "$(which lr-mcp)"
 ```
+
+The absolute path avoids depending on the `PATH` Claude Code was started with. If a `lightroom` server already exists, remove it first with `claude mcp remove lightroom -s user`. Start a new Claude Code session for the `lr_*` tools to appear. If you set `LR_MCP_HOME`, add `-e LR_MCP_HOME=/path/to/dir` before `--`.
 
 The client config can be added before or after signing in; without tokens the tools reply "Not signed in" and `lr_login` can do the sign-in from the chat.
 
@@ -141,11 +143,11 @@ The client config can be added before or after signing in; without tokens the to
 
 If a user asks you to set this server up:
 
-- **Never ask the user to paste the client secret into the chat, and never print `.env`.** Create the file with empty values (step 2, using the state directory `doctor` prints) and ask the user to fill it in with an editor. To check it without revealing values, `grep -cE '^ADOBE_CLIENT_(ID|SECRET)=.+' <state dir>/.env` must print `2`; `doctor` shows only the first characters of the client ID.
+- **Never ask the user to paste the client secret into the chat, and never print `.env`.** Create the file with empty values (step 2, using the state directory `doctor` prints, not the default path in the example) and ask the user to fill it in with an editor. If `.env` already exists, never recreate or overwrite it: it may already hold the user's secret. To check it without revealing values, `grep -cE '^ADOBE_CLIENT_(ID|SECRET)=.+' <state dir>/.env` must print `2`; `doctor` shows only the first characters of the client ID.
 - Install (step 0) and run `lr-mcp doctor` before giving the user the console steps: it checks the callback port first, and the redirect URI they enter must use a free port. Run `doctor` again after every step; a `fix:` that starts with `[human]` is something to hand to the user.
 - The user must create the credential, add the beta user, fill in `.env`, and finish the browser sign-in. Give them the exact console steps from step 1, with the port `doctor` reported in the redirect URI and pattern.
 - `lr-mcp login` blocks for up to 5 minutes while the user signs in. Run it in the background or ask the user to run it, and warn them about the certificate page.
-- Setup is done when `doctor` prints `Catalog found. Setup is complete.` Add the client config (step 5) before or after that. For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path from `which lr-mcp`, pass `LR_MCP_HOME` in `"env"` if it is set, and tell the user to quit and reopen the app.
+- Setup is done when `doctor` prints `Catalog found. Setup is complete.` Add the client config (step 5) before or after that. For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path from `which lr-mcp`, pass `LR_MCP_HOME` in `"env"` if it is set, and tell the user to quit and reopen the app. For Claude Code, register the absolute path and tell the user to start a new session.
 
 ## Development
 
