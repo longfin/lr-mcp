@@ -57,7 +57,7 @@ Each user needs their own credential: until Adobe reviews an integration it acce
 
 ### 2. Save the credential
 
-Settings live in a `.env` file in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). Environment variables with the same names override the file.
+Settings live in a `.env` file in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). Environment variables with the same names override the file, but keep the client secret in `.env`: an MCP client's `"env"` / `-e` stores it in plain text in the client's config.
 
 | Variable | Required | Description |
 |---|---|---|
@@ -99,7 +99,7 @@ Every line should start with `[ok]`, ending in `Catalog found. Setup is complete
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add an entry under `mcpServers`, keeping any existing ones (if a `lightroom` entry already exists, replace it). Claude Desktop does not read your shell's `PATH`, so use the absolute path printed by `which lr-mcp`:
+Add an entry under `mcpServers`, keeping any existing ones (if a `lightroom` entry already exists, check what it runs and whether it sets `"env"` before replacing it). Claude Desktop does not read your shell's `PATH`, so use the absolute path printed by `which lr-mcp`:
 
 ```json
 {
@@ -119,7 +119,7 @@ If you set `LR_MCP_HOME`, add `"env": {"LR_MCP_HOME": "/path/to/dir"}` to the en
 claude mcp add lightroom -s user -- "$(which lr-mcp)"
 ```
 
-The absolute path avoids depending on the `PATH` Claude Code was started with. If a `lightroom` server already exists, remove it first with `claude mcp remove lightroom -s user`. Start a new Claude Code session for the `lr_*` tools to appear. If you set `LR_MCP_HOME`, add `-e LR_MCP_HOME=/path/to/dir` before `--`.
+The absolute path avoids depending on the `PATH` Claude Code was started with; check that `which lr-mcp` prints a path first, or an empty command gets registered. If `claude mcp get lightroom` shows an existing server, check what it runs and its environment, then remove it with `claude mcp remove lightroom -s user` before adding. Start a new Claude Code session for the `lr_*` tools to appear. If you set `LR_MCP_HOME`, add `-e LR_MCP_HOME=/path/to/dir` before `--`.
 
 The client config can be added before or after signing in; without tokens the tools reply "Not signed in" and `lr_login` can do the sign-in from the chat.
 
@@ -143,11 +143,12 @@ The client config can be added before or after signing in; without tokens the to
 
 If a user asks you to set this server up:
 
-- **Never ask the user to paste the client secret into the chat, and never print `.env`.** Create the file with empty values (step 2, using the state directory `doctor` prints, not the default path in the example) and ask the user to fill it in with an editor. If `.env` already exists, never recreate or overwrite it: it may already hold the user's secret. To check it without revealing values, `grep -cE '^ADOBE_CLIENT_(ID|SECRET)=.+' <state dir>/.env` must print `2`; `doctor` shows only the first characters of the client ID.
+- **Never ask the user to paste the client secret into the chat, and never print the contents of the state directory**: `.env`, `.tokens.json`, `.certs/`, or editor backups such as `.env~`. Create `.env` with empty values (step 2, using the state directory `doctor` prints, not the default path in the example) and ask the user to fill it in with an editor. If `.env` already exists, never recreate or overwrite it: it may already hold the user's secret. To add `LR_MCP_PORT`, include it when creating the file, or append it with `>>` if `grep -q '^LR_MCP_PORT=' .env` finds nothing. To check the credentials without revealing values, `grep -cE '^ADOBE_CLIENT_(ID|SECRET)=.+' <state dir>/.env` must print `2`; `doctor` shows only the first characters of the client ID.
 - Install (step 0) and run `lr-mcp doctor` before giving the user the console steps: it checks the callback port first, and the redirect URI they enter must use a free port. Run `doctor` again after every step; a `fix:` that starts with `[human]` is something to hand to the user.
 - The user must create the credential, add the beta user, fill in `.env`, and finish the browser sign-in. Give them the exact console steps from step 1, with the port `doctor` reported in the redirect URI and pattern.
-- `lr-mcp login` blocks for up to 5 minutes while the user signs in. Run it in the background or ask the user to run it, and warn them about the certificate page.
-- Setup is done when `doctor` prints `Catalog found. Setup is complete.` Add the client config (step 5) before or after that. For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path from `which lr-mcp`, pass `LR_MCP_HOME` in `"env"` if it is set, and tell the user to quit and reopen the app. For Claude Code, register the absolute path and tell the user to start a new session.
+- Put only `LR_MCP_HOME` or `LR_MCP_PORT` in a client's `"env"` / `-e`, never `ADOBE_CLIENT_ID` or `ADOBE_CLIENT_SECRET`.
+- `lr-mcp login` blocks for up to 5 minutes while the user signs in; the `[human]` part is the browser sign-in. You may run it in the background, but first tell the user a browser window will open on their screen and warn them about the certificate page. Run `doctor` afterwards to confirm the sign-in.
+- Setup is done when `doctor` prints `Catalog found. Setup is complete.` Add the client config (step 5) before or after that. If a `lightroom` entry already exists in the client, show the user what it runs and ask before replacing it. For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path from `which lr-mcp`, pass `LR_MCP_HOME` in `"env"` if it is set, and tell the user to quit and reopen the app. For Claude Code, register the absolute path and tell the user to start a new session.
 
 ## Development
 
