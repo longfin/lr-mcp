@@ -3,8 +3,8 @@
 Configuration (environment variables take precedence over the .env file):
   ADOBE_CLIENT_ID       API key of your Adobe Developer Console project (required)
   ADOBE_CLIENT_SECRET   client secret of its OAuth Web App credential (required)
-  LR_MCP_PORT           local callback port (default 8000); the redirect URI
-                        https://localhost:<port>/callback must be allowed in the console
+  LR_MCP_PORT           local callback port (default 8000, or any free port when 8000 is busy);
+                        https://localhost:<port>/callback must match the console's redirect URI pattern
   LR_MCP_HOME           state directory (default: $XDG_CONFIG_HOME/lr-mcp or ~/.config/lr-mcp)
 
 State directory contents:
@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import ssl
 import subprocess
 import time
@@ -59,7 +60,7 @@ def _load_env():
 
 _load_env()
 PORT = int(os.environ.get("LR_MCP_PORT", "8000"))
-REDIRECT_URI = f"https://localhost:{PORT}/callback"
+PORT_SET = "LR_MCP_PORT" in os.environ
 
 
 def client_id():
@@ -77,6 +78,38 @@ def _client_secret():
 
 
 # ---------------------------------------------------------------- auth
+
+def port_free(port):
+    """`localhost` may resolve to ::1 or 127.0.0.1 in the browser, so a listener on either counts as busy."""
+    for family, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        with socket.socket(family) as s:
+            s.settimeout(0.5)
+            try:
+                s.connect((addr, port))
+                return False
+            except OSError:
+                pass
+    with socket.socket() as s:
+        try:
+            s.bind(("localhost", port))
+        except OSError:
+            return False
+    return True
+
+
+def callback_port():
+    """PORT if it is free or was set explicitly; otherwise a free port picked by the OS,
+    which works when the console's redirect URI pattern allows any port."""
+    if PORT_SET or port_free(PORT):
+        return PORT
+    for _ in range(10):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port_free(port):
+            return port
+    raise LrError("Could not find a free local port for the sign-in callback.")
+
 
 def _ensure_cert():
     cert, key = CERT_DIR / "localhost.pem", CERT_DIR / "localhost-key.pem"
@@ -145,11 +178,12 @@ def login(timeout=300, on_url=print):
             pass
 
     cert, key = _ensure_cert()
+    port = callback_port()
     try:
-        srv = http.server.HTTPServer(("localhost", PORT), Handler)
+        srv = http.server.HTTPServer(("localhost", port), Handler)
     except OSError as e:
-        raise LrError(f"Cannot listen on localhost:{PORT} ({e}). Set LR_MCP_PORT to a free port "
-                      f"and allow https://localhost:<port>/callback in the Adobe console.")
+        raise LrError(f"Cannot listen on localhost:{port} ({e}). Set LR_MCP_PORT to a free port "
+                      f"that the console's redirect URI pattern allows.")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
@@ -157,7 +191,7 @@ def login(timeout=300, on_url=print):
 
     url = f"{IMS}/authorize/v2?" + urllib.parse.urlencode({
         "client_id": cid, "scope": SCOPES, "response_type": "code",
-        "redirect_uri": REDIRECT_URI, "state": state,
+        "redirect_uri": f"https://localhost:{port}/callback", "state": state,
     })
     on_url(url)
     webbrowser.open(url)

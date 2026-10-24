@@ -43,7 +43,7 @@ lr-mcp doctor
 
 This puts an `lr-mcp` command in `~/.local/bin` (run `uv tool update-shell` and open a new terminal if the shell cannot find it). All later steps use it. Update with `uv tool upgrade lr-mcp`.
 
-`doctor` checks the setup in order and prints the first thing to fix. Before you start step 1, it confirms that the sign-in callback port (8000 by default) is free; if it is not, choose another port now (see step 2) so the redirect URI you enter in step 1 matches.
+`doctor` checks the setup in order and prints the first thing to fix.
 
 ### 1. Create an Adobe credential [human]
 
@@ -51,28 +51,25 @@ Each user needs their own credential: until Adobe reviews an integration it acce
 
 1. Sign in to the [Adobe Developer Console](https://developer.adobe.com/console) and click **Create new project**.
 2. In the project, click **Add API**, choose **Lightroom Services**, then pick the **OAuth Web App** credential type.
-3. Set **Default redirect URI** to `https://localhost:8000/callback` and **Redirect URI pattern** to `https://localhost:8000/.*`, then save. (If you chose another port in step 0, use it here instead of 8000.)
+3. Set **Default redirect URI** to `https://localhost:8000/callback` and **Redirect URI pattern** to `https://localhost:[0-9]+/callback`, then save. The pattern allows any port, so sign-in can use another one when 8000 is busy. A changed pattern can take a few minutes to apply.
 4. Open **Lightroom Services** in the project's left menu, click **Manage beta users**, and add the email of the Adobe account you will sign in with. Without this, the API refuses the account.
-5. Open **Credentials → OAuth Web App** and keep the **Client ID** and **Client Secret** at hand for step 2.
+5. Open **Credentials → OAuth Web App** and click **Download** to save the credential as JSON. It contains the client secret; step 2 reads it and can delete it.
 
 ### 2. Save the credential
 
-Settings live in a `.env` file in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). Environment variables with the same names override the file, but keep the client secret in `.env`: an MCP client's `"env"` / `-e` stores it in plain text in the client's config. Variables exported only in your shell are not seen by an MCP client started from the GUI, so put settings in `.env`.
+```bash
+lr-mcp setup --from ~/Downloads/<credential>.json --delete
+```
+
+This reads the client ID and secret from the downloaded file (the project JSON from the project overview's **Download** also works) and writes `ADOBE_CLIENT_ID` and `ADOBE_CLIENT_SECRET` to `.env` in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). The file gets mode 600 and keeps any other lines. Only the first characters of the client ID are printed. `--delete` removes the downloaded file afterwards; without it, delete the file yourself.
 
 | Variable | Required | Description |
 |---|---|---|
 | `ADOBE_CLIENT_ID` | yes | Client ID (also called API key) |
 | `ADOBE_CLIENT_SECRET` | yes | Client secret |
-| `LR_MCP_PORT` | no | Sign-in callback port, default `8000` |
+| `LR_MCP_PORT` | no | Sign-in callback port. Default `8000`; if it is busy and this is not set, sign-in picks a free port. |
 
-Create the file, then open it in an editor and paste the two values after the `=` signs (add `LR_MCP_PORT=<port>` if you are not using 8000). The commands below use the default directory; if `doctor` printed a different one, use that instead. An existing `.env` is left untouched:
-
-```bash
-mkdir -p ~/.config/lr-mcp
-[ -f ~/.config/lr-mcp/.env ] || printf 'ADOBE_CLIENT_ID=\nADOBE_CLIENT_SECRET=\n' > ~/.config/lr-mcp/.env
-chmod 600 ~/.config/lr-mcp/.env
-open -e ~/.config/lr-mcp/.env      # macOS; on Linux use any editor, e.g. nano
-```
+To enter the values by hand instead, put `ADOBE_CLIENT_ID=…` and `ADOBE_CLIENT_SECRET=…` lines in `.env` and `chmod 600` it. Environment variables with the same names override the file, but keep the client secret in `.env`: an MCP client's `"env"` / `-e` stores it in plain text in the client's config. Variables exported only in your shell are not seen by an MCP client started from the GUI, so put settings in `.env`.
 
 To keep the state somewhere else, set the environment variable `LR_MCP_HOME` to a directory. It cannot go in `.env` (it says where `.env` is), so it must also be set for `lr-mcp login` and in the MCP client config (`"env"` in step 5). If `XDG_CONFIG_HOME` is set, the default is `$XDG_CONFIG_HOME/lr-mcp`; if it is set only in your shell, the MCP client will not see it, so set `LR_MCP_HOME` in the client config to the directory `doctor` prints.
 
@@ -82,7 +79,7 @@ To keep the state somewhere else, set the environment variable `LR_MCP_HOME` to 
 lr-mcp login
 ```
 
-A browser window opens on the Adobe sign-in page. Sign in with the account added as a beta user and allow access. Adobe then redirects to `https://localhost:8000/callback`, which uses a self-signed certificate, so the browser shows a certificate warning: choose **Advanced → Proceed to localhost** (Chrome) or **Show Details → visit this website** (Safari). The page then says "Signed in" and the terminal prints where the tokens were saved. Tokens are stored with mode 600 and refreshed automatically.
+A browser window opens on the Adobe sign-in page. Sign in with the account added as a beta user and allow access. Adobe then redirects to `https://localhost:<port>/callback` (8000 unless it was busy), which uses a self-signed certificate, so the browser shows a certificate warning: choose **Advanced → Proceed to localhost** (Chrome) or **Show Details → visit this website** (Safari). The page then says "Signed in" and the terminal prints where the tokens were saved. Tokens are stored with mode 600 and refreshed automatically.
 
 ### 4. Check
 
@@ -128,13 +125,14 @@ The client config can be added before or after signing in; without tokens the to
 | Symptom | Fix |
 |---|---|
 | `lr-mcp: command not found` | Run `uv tool update-shell` and open a new terminal, or call `~/.local/bin/lr-mcp` directly. |
-| `doctor`: `Callback port … is in use` | Put `LR_MCP_PORT=<free port>` in `.env` and use that port in the console's redirect URI. |
-| `doctor`: `Not set: ADOBE_CLIENT_ID…` | Step 2: fill in `.env` in the state directory. |
-| The Adobe sign-in page shows an error right away | Usually a wrong `ADOBE_CLIENT_ID`: `doctor` cannot verify it before sign-in. Copy it again from the console. |
-| `doctor`: `rejected the client id` | `ADOBE_CLIENT_ID` is wrong or the tokens belong to another credential. Fix `.env`, then sign in again. |
+| `doctor`: `Callback port … (LR_MCP_PORT) is in use` | Change `LR_MCP_PORT` in `.env` to a free port, or remove it so sign-in picks one. |
+| `doctor`: `Not set: ADOBE_CLIENT_ID…` | Step 2: run `lr-mcp setup --from <credential>.json`. |
+| `setup`: `The file has 2 credentials` | Download only the OAuth Web App credential (step 1.5) instead of the whole project, and retry. |
+| The Adobe sign-in page shows an error right away | Usually a wrong `ADOBE_CLIENT_ID`: `doctor` cannot verify it before sign-in. Run step 2 again with the right credential JSON. |
+| `doctor`: `rejected the client id` | `ADOBE_CLIENT_ID` is wrong or the tokens belong to another credential. Run step 2 again with the right credential JSON, then sign in again. |
 | `doctor`: `Lightroom API refused the account` | The signed-in account is not a beta user (step 1.4) or has no Lightroom plan. |
-| The sign-in page says the redirect URI is invalid | The console's redirect URI must be exactly `https://localhost:<port>/callback`, with the same port as `LR_MCP_PORT`. |
-| The sign-in redirect shows another app's page or never loads | Something else listens on the port (`lsof -iTCP:<port> -sTCP:LISTEN`). Use another port as above. |
+| The browser lands on `https://localhost:8000/callback` although sign-in used another port | Adobe silently falls back to the default redirect URI when the requested one does not match the pattern. Set the pattern to `https://localhost:[0-9]+/callback` (step 1.3; `\d` is not supported). Credentials set up with `https://localhost:8000/.*` need this change. |
+| The sign-in redirect shows another app's page or never loads | Something else listens on the port (`lsof -iTCP:<port> -sTCP:LISTEN`). Stop it, or set `LR_MCP_PORT` to a free port. |
 | `login` times out after 5 minutes | The browser stopped at the certificate warning; proceed past it next time. |
 | `Token refresh failed` | Run `lr-mcp login` again. |
 | Tools missing in Claude Desktop | Use the absolute path to `lr-mcp`, fully restart the app, and read the log file above. |
@@ -143,9 +141,9 @@ The client config can be added before or after signing in; without tokens the to
 
 If a user asks you to set this server up:
 
-- **Never ask the user to paste the client secret into the chat, and never print the contents of the state directory**: `.env`, `.tokens.json`, `.certs/`, or editor backups such as `.env~`. Create `.env` with empty values (step 2, using the state directory `doctor` prints, not the default path in the example) and ask the user to fill it in with an editor. If `.env` already exists, never recreate or overwrite it: it may already hold the user's secret. To add `LR_MCP_PORT`, include it when creating the file (`printf 'ADOBE_CLIENT_ID=\nADOBE_CLIENT_SECRET=\nLR_MCP_PORT=<port>\n'`), or, if `grep -q '^LR_MCP_PORT=' .env` finds nothing, append it with a leading newline: `printf '\nLR_MCP_PORT=<port>\n' >> .env`. The user's editor may have saved the file without a final newline, and appending without one corrupts the secret line. To check the credentials without revealing values, `grep -cE '^ADOBE_CLIENT_(ID|SECRET)=.+' <state dir>/.env` should print `2`; this is only a rough check (it accepts placeholders and blank values), so rely on `doctor`. `doctor` shows only the first characters of the client ID.
-- Install (step 0) and run `lr-mcp doctor` before giving the user the console steps: it checks the callback port first, and the redirect URI they enter must use a free port. Run `doctor` again after every step; a `fix:` that starts with `[human]` is something to hand to the user.
-- The user must create the credential, add the beta user, fill in `.env`, and finish the browser sign-in. Give them the exact console steps from step 1, with the port `doctor` reported in the redirect URI and pattern.
+- **Never ask the user to paste the client secret into the chat, and never read or print the downloaded credential JSON or the contents of the state directory** (`.env`, `.tokens.json`, `.certs/`, editor backups such as `.env~`). Save the credential with `lr-mcp setup --from <file> --delete` (step 2). Only pass the file's path; listing file names, e.g. `ls -t ~/Downloads/*.json`, is fine. If more than one file could be it, ask the user which. `setup` replaces only the `ADOBE_CLIENT_*` lines in `.env`, so it is safe to run on an existing file.
+- Install (step 0) and run `lr-mcp doctor` first. If it already prints `Setup is complete.`, skip to step 5. Run `doctor` again after every step; a `fix:` that starts with `[human]` is something to hand to the user.
+- The user must create the credential, add the beta user, download the credential JSON, and finish the browser sign-in. Give them the exact console steps from step 1; the redirect URI values are the same for everyone.
 - Put only `LR_MCP_HOME` or `LR_MCP_PORT` in a client's `"env"` / `-e`, never `ADOBE_CLIENT_ID` or `ADOBE_CLIENT_SECRET`.
 - `lr-mcp login` blocks for up to 5 minutes while the user signs in; the `[human]` part is the browser sign-in. You may run it in the background, but first tell the user a browser window will open on their screen and warn them about the certificate page. Run `doctor` afterwards to confirm the sign-in.
 - Setup is done when `doctor` prints `Catalog found. Setup is complete.` Add the client config (step 5) before or after that. If a `lightroom` entry already exists in the client, show the user what it runs and ask before replacing it. When reading `claude mcp get` output or `claude_desktop_config.json`, show only commands and env variable names, never env values: they may hold other servers' secrets. For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path from `which lr-mcp`, pass `LR_MCP_HOME` in `"env"` if it is set, and tell the user to quit and reopen the app. For Claude Code, register the absolute path and tell the user to start a new session.

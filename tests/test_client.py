@@ -73,3 +73,16 @@ def test_access_token_does_not_refresh_when_fresh(monkeypatch):
                                          "expires_in": 86400, "obtained_at": int(time.time())}))
     monkeypatch.setattr(lr.urllib.request, "urlopen", lambda req: pytest.fail("should not refresh"))
     assert lr.access_token() == "fresh"
+
+
+def test_callback_port_falls_back_when_default_is_busy(monkeypatch):
+    monkeypatch.setattr(lr, "PORT_SET", False)
+    monkeypatch.setattr(lr, "port_free", lambda port: port != lr.PORT)
+    port = lr.callback_port()
+    assert port != lr.PORT and port > 0
+
+
+def test_callback_port_keeps_explicit_port(monkeypatch):
+    monkeypatch.setattr(lr, "PORT_SET", True)
+    monkeypatch.setattr(lr, "port_free", lambda port: False)
+    assert lr.callback_port() == lr.PORT

@@ -25,24 +25,40 @@ def test_all_ok(monkeypatch):
 
 def test_missing_credentials(monkeypatch):
     monkeypatch.delenv("ADOBE_CLIENT_SECRET")
-    monkeypatch.setattr(doctor, "_port_free", lambda port: True)
+    monkeypatch.setattr(lr, "port_free", lambda port: True)
     ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
     assert not ok and "ADOBE_CLIENT_SECRET" in msg and fix.startswith("[human]")
 
 
 def test_not_signed_in(monkeypatch):
-    monkeypatch.setattr(doctor, "_port_free", lambda port: True)
+    monkeypatch.setattr(lr, "port_free", lambda port: True)
     ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
     assert not ok and msg == "Not signed in" and "lr-mcp login" in fix
 
 
-def test_port_in_use_is_reported_before_credentials(monkeypatch):
+def test_set_port_in_use_is_reported_before_credentials(monkeypatch):
     monkeypatch.delenv("ADOBE_CLIENT_ID")
-    monkeypatch.setattr(doctor, "_port_free", lambda port: False)
+    monkeypatch.setattr(lr, "port_free", lambda port: False)
+    monkeypatch.setattr(lr, "PORT_SET", True)
     out = results(monkeypatch, signed_in=False)
     ok, msg, fix = out[-1]
     assert not ok and "in use" in msg and "LR_MCP_PORT" in fix
     assert not any("ADOBE_CLIENT_ID" in m for _, m, _ in out)
+
+
+def test_default_port_in_use_is_not_fatal(monkeypatch):
+    monkeypatch.setattr(lr, "port_free", lambda port: False)
+    monkeypatch.setattr(lr, "PORT_SET", False)
+    out = results(monkeypatch, signed_in=False)
+    assert any(ok and "pick a free port" in m for ok, m, _ in out)
+    assert out[-1][1] == "Not signed in"
+
+
+def test_missing_credentials_suggests_setup(monkeypatch):
+    monkeypatch.delenv("ADOBE_CLIENT_ID")
+    monkeypatch.setattr(lr, "port_free", lambda port: True)
+    ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
+    assert not ok and "setup --from" in fix
 
 
 def test_wrong_api_key(monkeypatch):
@@ -60,10 +76,10 @@ def test_port_busy_on_ipv6_only():
     with socket.socket(socket.AF_INET6) as s:
         s.bind(("::1", 0))
         s.listen()
-        assert not doctor._port_free(s.getsockname()[1])
+        assert not lr.port_free(s.getsockname()[1])
 
 
 def test_login_hint_includes_custom_home(monkeypatch):
-    monkeypatch.setattr(doctor, "_port_free", lambda port: True)
+    monkeypatch.setattr(lr, "port_free", lambda port: True)
     ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
     assert f"LR_MCP_HOME={lr.HOME}" in fix or str(lr.HOME) in fix
