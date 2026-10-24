@@ -5,6 +5,7 @@
 `lr-mcp doctor` check the setup and say what to fix next
 """
 import asyncio
+import itertools
 import re
 import sys
 import time
@@ -32,6 +33,7 @@ mcp = MCPServer(
 # ---------------------------------------------------------------- helpers
 
 _albums_cache = (0.0, None)
+MAX_SCAN = 20000  # assets lr_list_photos looks at before giving up
 
 
 def _albums():
@@ -224,8 +226,8 @@ def lr_list_photos(
         captured_after += "T00:00:00"
     if captured_before and len(captured_before) == 10:
         captured_before += "T23:59:59"
-    out, scanned, max_scan = [], 0, 20000
-    for a in _iter_assets(album_id, captured_after, captured_before):
+    out, scanned, capped = [], 0, False
+    for a in itertools.islice(_iter_assets(album_id, captured_after, captured_before), MAX_SCAN):
         scanned += 1
         s = _summary(a)
         cap = (s["captured"] or "")[:19]
@@ -255,11 +257,19 @@ def lr_list_photos(
                     or (min_fnumber is not None and f < min_fnumber):
                 continue
         out.append(s)
-        if len(out) >= limit or scanned >= max_scan:
+        if len(out) >= limit:
             break
+    else:
+        # the loop ran out without a break: either the catalog ended or the scan cap did
+        capped = scanned >= MAX_SCAN
     if album_id:
         out.sort(key=lambda s: s["captured"] or "")
-    head = f"{len(out)} photos (scanned {scanned}{', limit reached' if len(out) >= limit else ''})"
+    note = ", limit reached" if len(out) >= limit else ""
+    if capped:
+        note += ", scan limit reached — results are partial"
+        if not album_id:
+            note += "; narrow with captured_after"
+    head = f"{len(out)} photos (scanned {scanned}{note})"
     return head + "\n" + "\n".join(_fmt(s) for s in out)
 
 

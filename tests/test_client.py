@@ -73,3 +73,50 @@ def test_access_token_does_not_refresh_when_fresh(monkeypatch):
                                          "expires_in": 86400, "obtained_at": int(time.time())}))
     monkeypatch.setattr(lr.urllib.request, "urlopen", lambda req: pytest.fail("should not refresh"))
     assert lr.access_token() == "fresh"
+
+
+def _client(monkeypatch):
+    monkeypatch.setattr(lr, "access_token", lambda: "tok")
+    monkeypatch.setattr(lr.time, "sleep", lambda s: None)
+
+
+def test_get_retries_incomplete_read(monkeypatch):
+    _client(monkeypatch)
+    calls = []
+
+    def urlopen(req):
+        calls.append(req.get_method())
+        if len(calls) < 3:
+            raise lr.http.client.IncompleteRead(b"x" * 10, 90)
+        resp = _Resp(b"ok")
+        resp.status = 200
+        return resp
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    assert lr.request("GET", "/v2/account") == (200, b"ok")
+    assert calls == ["GET"] * 3
+
+
+def test_get_gives_up_with_lr_error(monkeypatch):
+    _client(monkeypatch)
+
+    def urlopen(req):
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    with pytest.raises(lr.LrError, match=f"failed after {lr.GET_ATTEMPTS} attempts"):
+        lr.request("GET", "/v2/account")
+
+
+def test_post_is_not_retried(monkeypatch):
+    _client(monkeypatch)
+    calls = []
+
+    def urlopen(req):
+        calls.append(1)
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    with pytest.raises(lr.LrError):
+        lr.request("POST", "/v2/x", body={})
+    assert calls == [1]

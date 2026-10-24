@@ -173,3 +173,25 @@ def test_list_photos_fnumber(monkeypatch):
     assert _ids(server.lr_list_photos(album_id="x", min_fnumber=8)) == ["f8"]
     assert _ids(server.lr_list_photos(album_id="x", min_fnumber=2, max_fnumber=4)) == ["f2", "f4"]
     assert len(_ids(server.lr_list_photos(album_id="x"))) == 5
+
+
+def test_list_photos_stops_at_scan_cap_without_matches(monkeypatch):
+    monkeypatch.setattr(server, "MAX_SCAN", 5)
+    pulled = []
+
+    def paginate(path):
+        for i in range(100):
+            pulled.append(i)
+            yield asset(f"a{i}", f"2024-05-01T12:{i:02d}:00")
+
+    monkeypatch.setattr(server.lr, "paginate", paginate)
+    out = server.lr_list_photos(captured_after="2024-05-01", flag="reject")
+    assert out.splitlines()[0].startswith("0 photos (scanned 5, scan limit reached")
+    assert len(pulled) == 5
+
+
+def test_list_photos_no_cap_note_when_catalog_ends(monkeypatch):
+    monkeypatch.setattr(server, "MAX_SCAN", 5)
+    items = [asset(f"a{i}", "2024-05-01T12:00:00") for i in range(3)]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(items))
+    assert server.lr_list_photos(captured_after="2024-05-01").splitlines()[0] == "3 photos (scanned 3)"
