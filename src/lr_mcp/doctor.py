@@ -51,7 +51,7 @@ def checks():
     missing = [k for k in ("ADOBE_CLIENT_ID", "ADOBE_CLIENT_SECRET") if not os.environ.get(k)]
     if missing:
         yield False, f"Not set: {', '.join(missing)}", (
-            f"[human] Create an OAuth Web App credential in the Adobe Developer Console (README step 1), "
+            f"[human] Create an OAuth Web App credential at https://developer.adobe.com/console (README step 1), "
             f"then put ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET in {lr.HOME / '.env'} (README step 2).")
         return
     cid = os.environ["ADOBE_CLIENT_ID"]
@@ -59,8 +59,8 @@ def checks():
 
     if not lr.TOKEN_FILE.exists():
         yield False, "Not signed in", (
-            f"[human] Run `{_login_cmd()}` and finish sign-in in the browser "
-            "(accept the localhost certificate warning).")
+            f"[human] Finish sign-in in the browser after running `{_login_cmd()}` (an agent may start it "
+            "in the background after telling the user) and accept the localhost certificate warning.")
         return
 
     try:
