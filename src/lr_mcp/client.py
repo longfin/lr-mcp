@@ -3,7 +3,7 @@
 Configuration (environment variables take precedence over the .env file):
   ADOBE_CLIENT_ID       API key of your Adobe Developer Console project (required)
   ADOBE_CLIENT_SECRET   client secret of its OAuth Web App credential (required)
-  LR_MCP_PORT           local callback port (default 8000, or any free port when 8000 is busy);
+  LR_MCP_PORT           local callback port (default 8000, or a free port when 8000 is busy);
                         https://localhost:<port>/callback must match the console's redirect URI pattern
   LR_MCP_HOME           state directory (default: $XDG_CONFIG_HOME/lr-mcp or ~/.config/lr-mcp)
 
@@ -49,18 +49,32 @@ class LrError(ToolError):
     """Subclasses ToolError so the message reaches the model instead of a generic error."""
 
 
+def parse_env(text):
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*([A-Z_]+)\s*=\s*['\"]?(.*?)['\"]?\s*$", line)
+        if m:
+            out.setdefault(m.group(1), m.group(2))
+    return out
+
+
 def _load_env():
     env = HOME / ".env"
     if env.exists():
-        for line in env.read_text().splitlines():
-            m = re.match(r"\s*([A-Z_]+)\s*=\s*['\"]?(.*?)['\"]?\s*$", line)
-            if m:
-                os.environ.setdefault(m.group(1), m.group(2))
+        for k, v in parse_env(env.read_text()).items():
+            os.environ.setdefault(k, v)
 
 
+# variables set before .env is loaded; they take precedence over anything written to .env
+SHELL_ENV = {k: os.environ[k] for k in ("ADOBE_CLIENT_ID", "ADOBE_CLIENT_SECRET") if k in os.environ}
 _load_env()
-PORT = int(os.environ.get("LR_MCP_PORT", "8000"))
 PORT_SET = "LR_MCP_PORT" in os.environ
+try:
+    PORT = int(os.environ.get("LR_MCP_PORT", "8000"))
+    PORT_ERROR = None
+except ValueError:
+    # don't fail at import: `setup` and `doctor` must still run to fix it
+    PORT, PORT_ERROR = 8000, f"LR_MCP_PORT is not a number: {os.environ['LR_MCP_PORT']!r}"
 
 
 def client_id():
@@ -79,17 +93,25 @@ def _client_secret():
 
 # ---------------------------------------------------------------- auth
 
-def port_free(port):
-    """`localhost` may resolve to ::1 or 127.0.0.1 in the browser, so a listener on either counts as busy."""
+def _listening(port):
+    """`localhost` may resolve to ::1 or 127.0.0.1 in the browser, so a listener on either counts."""
     for family, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-        with socket.socket(family) as s:
-            s.settimeout(0.5)
-            try:
+        try:
+            with socket.socket(family) as s:
+                s.settimeout(0.5)
                 s.connect((addr, port))
-                return False
-            except OSError:
-                pass
+                return True
+        except OSError:  # nothing listening, or no IPv6 on this host
+            pass
+    return False
+
+
+def port_free(port):
+    if _listening(port):
+        return False
     with socket.socket() as s:
+        # like HTTPServer, so a port left in TIME_WAIT by an earlier sign-in counts as free
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("localhost", port))
         except OSError:
@@ -97,17 +119,22 @@ def port_free(port):
     return True
 
 
-def callback_port():
-    """PORT if it is free or was set explicitly; otherwise a free port picked by the OS,
-    which works when the console's redirect URI pattern allows any port."""
-    if PORT_SET or port_free(PORT):
-        return PORT
-    for _ in range(10):
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        if port_free(port):
-            return port
+def _callback_server(handler):
+    """Listen on PORT, or, unless LR_MCP_PORT is set, on a free port picked by the OS when PORT is
+    taken; that works when the console's redirect URI pattern allows any port."""
+    if PORT_ERROR:
+        raise LrError(PORT_ERROR)
+    for port in ([PORT] if PORT_SET else [PORT, 0]):
+        if port and _listening(port):
+            if PORT_SET:
+                raise LrError(f"Port {port} (LR_MCP_PORT) is in use. Set LR_MCP_PORT to a free port that "
+                              "the console's redirect URI pattern allows, or remove it.")
+            continue
+        try:
+            return http.server.HTTPServer(("localhost", port), handler)
+        except OSError as e:
+            if PORT_SET or not port:
+                raise LrError(f"Cannot listen on localhost:{port} ({e}).")
     raise LrError("Could not find a free local port for the sign-in callback.")
 
 
@@ -178,12 +205,8 @@ def login(timeout=300, on_url=print):
             pass
 
     cert, key = _ensure_cert()
-    port = callback_port()
-    try:
-        srv = http.server.HTTPServer(("localhost", port), Handler)
-    except OSError as e:
-        raise LrError(f"Cannot listen on localhost:{port} ({e}). Set LR_MCP_PORT to a free port "
-                      f"that the console's redirect URI pattern allows.")
+    srv = _callback_server(Handler)
+    port = srv.server_address[1]
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
@@ -208,7 +231,12 @@ def login(timeout=300, on_url=print):
     if "error" in result:
         raise LrError(f"Authorization failed: {result}")
     if "code" not in result:
-        raise LrError(f"Sign-in was not completed within {timeout} seconds.")
+        hint = ""
+        if port != PORT:
+            hint = (f" Port {PORT} was busy, so sign-in used port {port}. If the browser ended up on "
+                    f"https://localhost:{PORT}/callback instead, set the console's redirect URI pattern to "
+                    f"https://localhost:[0-9]+/callback, or free port {PORT}.")
+        raise LrError(f"Sign-in was not completed within {timeout} seconds.{hint}")
     if result.get("state") != state:
         raise LrError("OAuth state mismatch.")
     return _token_request({"grant_type": "authorization_code", "code": result["code"]})

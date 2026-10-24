@@ -1,6 +1,7 @@
 """`lr-mcp doctor`: check each setup step in order and say how to fix the first one that fails."""
 import json
 import os
+import shlex
 import shutil
 
 from . import client as lr
@@ -8,7 +9,7 @@ from .client import LrError
 
 def _cmd(args):
     home = os.environ.get("LR_MCP_HOME")
-    return f"LR_MCP_HOME={home} lr-mcp {args}" if home else f"lr-mcp {args}"
+    return f"LR_MCP_HOME={shlex.quote(home)} lr-mcp {args}" if home else f"lr-mcp {args}"
 
 def _login_cmd():
     return _cmd("login")
@@ -22,6 +23,10 @@ def checks():
         if not shutil.which("openssl"):
             yield False, "openssl not found (needed for the sign-in callback certificate)", (
                 "Install openssl (e.g. `brew install openssl` or your distro's package).")
+            return
+        if lr.PORT_ERROR:
+            yield False, lr.PORT_ERROR, (
+                f"Set LR_MCP_PORT in {lr.HOME / '.env'} to a port number, or remove it.")
             return
         if lr.port_free(lr.PORT):
             yield True, f"Callback port {lr.PORT} is free (redirect URI https://localhost:{lr.PORT}/callback)", None

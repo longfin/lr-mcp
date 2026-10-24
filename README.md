@@ -61,7 +61,7 @@ Each user needs their own credential: until Adobe reviews an integration it acce
 lr-mcp setup --from ~/Downloads/<credential>.json --delete
 ```
 
-This reads the client ID and secret from the downloaded file (the project JSON from the project overview's **Download** also works) and writes `ADOBE_CLIENT_ID` and `ADOBE_CLIENT_SECRET` to `.env` in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). The file gets mode 600 and keeps any other lines. Only the first characters of the client ID are printed. `--delete` removes the downloaded file afterwards; without it, delete the file yourself.
+`setup` needs lr-mcp 0.3.0 or later (`uv tool upgrade lr-mcp`). It reads the client ID and secret from the downloaded file (the project JSON from the project overview's **Download** also works) and writes `ADOBE_CLIENT_ID` and `ADOBE_CLIENT_SECRET` to `.env` in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). The file gets mode 600 and keeps any other lines. Only the first characters of the client ID are printed. `--delete` removes the downloaded file afterwards; without it, delete the file yourself.
 
 | Variable | Required | Description |
 |---|---|---|
@@ -131,7 +131,7 @@ The client config can be added before or after signing in; without tokens the to
 | The Adobe sign-in page shows an error right away | Usually a wrong `ADOBE_CLIENT_ID`: `doctor` cannot verify it before sign-in. Run step 2 again with the right credential JSON. |
 | `doctor`: `rejected the client id` | `ADOBE_CLIENT_ID` is wrong or the tokens belong to another credential. Run step 2 again with the right credential JSON, then sign in again. |
 | `doctor`: `Lightroom API refused the account` | The signed-in account is not a beta user (step 1.4) or has no Lightroom plan. |
-| The browser lands on `https://localhost:8000/callback` although sign-in used another port | Adobe silently falls back to the default redirect URI when the requested one does not match the pattern. Set the pattern to `https://localhost:[0-9]+/callback` (step 1.3; `\d` is not supported). Credentials set up with `https://localhost:8000/.*` need this change. |
+| The browser lands on `https://localhost:8000/callback` although sign-in used another port (`login` times out and says which port it used) | Adobe silently falls back to the default redirect URI when the requested one does not match the pattern. Set the pattern to `https://localhost:[0-9]+/callback` (step 1.3; `\d` is not supported). Credentials set up with `https://localhost:8000/.*` need this change. |
 | The sign-in redirect shows another app's page or never loads | Something else listens on the port (`lsof -iTCP:<port> -sTCP:LISTEN`). Stop it, or set `LR_MCP_PORT` to a free port. |
 | `login` times out after 5 minutes | The browser stopped at the certificate warning; proceed past it next time. |
 | `Token refresh failed` | Run `lr-mcp login` again. |

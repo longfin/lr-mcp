@@ -83,3 +83,14 @@ def test_login_hint_includes_custom_home(monkeypatch):
     monkeypatch.setattr(lr, "port_free", lambda port: True)
     ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
     assert f"LR_MCP_HOME={lr.HOME}" in fix or str(lr.HOME) in fix
+
+
+def test_bad_port_value(monkeypatch):
+    monkeypatch.setattr(lr, "PORT_ERROR", "LR_MCP_PORT is not a number: ''")
+    ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
+    assert not ok and "not a number" in msg
+
+
+def test_hint_quotes_home_with_spaces(monkeypatch):
+    monkeypatch.setenv("LR_MCP_HOME", "/tmp/a b")
+    assert doctor._cmd("login") == "LR_MCP_HOME='/tmp/a b' lr-mcp login"

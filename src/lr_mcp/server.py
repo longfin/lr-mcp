@@ -432,7 +432,7 @@ def main():
         sys.exit(0 if run() else 1)
     args = sys.argv[1:]
     if len(args) >= 3 and args[:2] == ["setup", "--from"] and args[3:] in ([], ["--delete"]):
-        from .setup import run
+        from .credentials import run
         try:
             run(args[2], delete=len(args) == 4)
         except LrError as e:
