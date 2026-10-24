@@ -13,6 +13,7 @@ State directory contents:
   .certs/       self-signed certificate for the HTTPS callback
 """
 import base64
+import http.client
 import http.server
 import json
 import os
@@ -203,6 +204,9 @@ def access_token():
 
 # ---------------------------------------------------------------- http
 
+GET_ATTEMPTS = 6
+
+
 def request(method, path, body=None, content_type="application/json", auth=True, headers=None):
     """`path` is '/v2/...' or an absolute URL. Returns (status, bytes)."""
     headers = {"X-API-Key": client_id(), **(headers or {})}
@@ -214,11 +218,19 @@ def request(method, path, body=None, content_type="application/json", auth=True,
         headers["Content-Type"] = content_type
     url = path if path.startswith("https://") else LR + path
     req = urllib.request.Request(url, method=method, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req) as r:
-            return r.status, r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
+    # Adobe often drops the connection mid-body on large pages when requests overlap,
+    # so GETs (safe to repeat) are retried with backoff.
+    attempts = GET_ATTEMPTS if method == "GET" else 1
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except (http.client.HTTPException, urllib.error.URLError, OSError) as e:
+            if attempt + 1 == attempts:
+                raise LrError(f"{method} {url} failed after {attempts} attempts: {e!r}") from e
+            time.sleep(1 + 2 * attempt)
 
 
 def parse(body):
