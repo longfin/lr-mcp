@@ -3,6 +3,8 @@
 `lr-mcp`        run the stdio MCP server
 `lr-mcp login`  sign in from the terminal (opens a browser)
 `lr-mcp doctor` check the setup and say what to fix next
+`lr-mcp setup --from <file> [--delete]`
+                save the credential from a JSON file downloaded from the Adobe Developer Console
 """
 import asyncio
 import re
@@ -428,6 +430,14 @@ def main():
     if sys.argv[1:] == ["doctor"]:
         from .doctor import run
         sys.exit(0 if run() else 1)
+    args = sys.argv[1:]
+    if len(args) >= 3 and args[:2] == ["setup", "--from"] and args[3:] in ([], ["--delete"]):
+        from .credentials import run
+        try:
+            run(args[2], delete=len(args) == 4)
+        except LrError as e:
+            sys.exit(str(e))
+        return
     if sys.argv[1:]:
         sys.exit(__doc__)
     mcp.run()

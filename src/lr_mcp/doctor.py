@@ -1,35 +1,18 @@
 """`lr-mcp doctor`: check each setup step in order and say how to fix the first one that fails."""
 import json
 import os
+import shlex
 import shutil
-import socket
 
 from . import client as lr
 from .client import LrError
 
-
-def _port_free(port):
-    """`localhost` may resolve to ::1 or 127.0.0.1 in the browser, so a listener on either counts as busy."""
-    for family, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-        with socket.socket(family) as s:
-            s.settimeout(0.5)
-            try:
-                s.connect((addr, port))
-                return False
-            except OSError:
-                pass
-    with socket.socket() as s:
-        try:
-            s.bind(("localhost", port))
-        except OSError:
-            return False
-    return True
-
+def _cmd(args):
+    home = os.environ.get("LR_MCP_HOME")
+    return f"LR_MCP_HOME={shlex.quote(home)} lr-mcp {args}" if home else f"lr-mcp {args}"
 
 def _login_cmd():
-    home = os.environ.get("LR_MCP_HOME")
-    return f"LR_MCP_HOME={home} lr-mcp login" if home else "lr-mcp login"
-
+    return _cmd("login")
 
 def checks():
     """Yield (ok, message, fix). Stops after the first failure that later checks depend on."""
@@ -41,18 +24,27 @@ def checks():
             yield False, "openssl not found (needed for the sign-in callback certificate)", (
                 "Install openssl (e.g. `brew install openssl` or your distro's package).")
             return
-        if not _port_free(lr.PORT):
-            yield False, f"Callback port {lr.PORT} is in use", (
-                f"Pick a free port, put LR_MCP_PORT=<port> in {lr.HOME / '.env'}, and use "
-                "https://localhost:<port>/callback as the redirect URI in the Adobe console.")
+        if lr.PORT_ERROR:
+            yield False, lr.PORT_ERROR, (
+                f"Set LR_MCP_PORT in {lr.HOME / '.env'} to a port number, or remove it.")
             return
-        yield True, f"Callback port {lr.PORT} is free (redirect URI https://localhost:{lr.PORT}/callback)", None
+        if lr.port_free(lr.PORT):
+            yield True, f"Callback port {lr.PORT} is free (redirect URI https://localhost:{lr.PORT}/callback)", None
+        elif lr.PORT_SET:
+            yield False, f"Callback port {lr.PORT} (LR_MCP_PORT) is in use", (
+                f"Change LR_MCP_PORT in {lr.HOME / '.env'} to a free port, or remove it so sign-in "
+                "picks one.")
+            return
+        else:
+            yield True, (f"Callback port {lr.PORT} is in use; sign-in will pick a free port, which needs "
+                         "the redirect URI pattern https://localhost:[0-9]+/callback in the Adobe console"), None
 
     missing = [k for k in ("ADOBE_CLIENT_ID", "ADOBE_CLIENT_SECRET") if not os.environ.get(k)]
     if missing:
         yield False, f"Not set: {', '.join(missing)}", (
-            f"[human] Create an OAuth Web App credential at https://developer.adobe.com/console (README step 1), "
-            f"then put ADOBE_CLIENT_ID and ADOBE_CLIENT_SECRET in {lr.HOME / '.env'} (README step 2).")
+            f"[human] Create an OAuth Web App credential at https://developer.adobe.com/console and download "
+            f"it as JSON (README step 1), then run `{_cmd('setup --from <file>.json --delete')}` "
+            "(README step 2).")
         return
     cid = os.environ["ADOBE_CLIENT_ID"]
     yield True, f"Credentials set (client id {cid[:6] + '…' if len(cid) > 12 else 'set'})", None
