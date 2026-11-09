@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -351,3 +352,133 @@ def test_list_photos_flags_unsupported_album_order(monkeypatch):
 def test_list_photos_rejects_bad_limit():
     with pytest.raises(LrError, match="limit"):
         server.lr_list_photos(album_id="x", limit=0)
+
+
+    assert head == "0 photos (scanned 2, scan limit reached — results are partial)"
+
+
+@pytest.fixture
+def lib(monkeypatch):
+    """Two photos (same stem, so the second is IMG-2.jpg) and a video; counts rendition calls."""
+    items = [asset("a1", "2024-05-01T12:00:00"), asset("a2", "2024-05-01T12:01:00"),
+             {"id": "v1", "subtype": "video", "payload": {}}]
+    for a in items[:2]:
+        a["payload"]["develop"] = {"userUpdated": "2024-06-01T00:00:00Z"}
+    lib = SimpleNamespace(items=items, calls=[], fail=set())
+
+    def rendition(aid, size):
+        lib.calls.append(aid)
+        if aid in lib.fail:
+            raise LrError("generation timed out")
+        return f"{aid}-{size}".encode()
+
+    monkeypatch.setattr(server.lr, "get_json", lambda path: {"resources": items})
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    return lib
+
+
+def _dl(tmp_path, **kw):
+    return server.lr_download_photos(asset_ids=["a1", "a2", "v1"], dest_dir=str(tmp_path), **kw)
+
+
+def test_download_writes_files_and_sidecar(lib, tmp_path):
+    out = _dl(tmp_path, size="2560")
+    assert out.splitlines()[0] == f"Saved 2 photos to {tmp_path}"
+    assert "Skipped 1 non-image" in out
+    assert (tmp_path / "IMG-2.jpg").read_bytes() == b"a2-2560"
+    side = json.loads((tmp_path / ".lr-mcp.json").read_text())
+    assert side["IMG.jpg"] == {"asset_id": "a1", "size": "2560", "updated": "2024-06-01T00:00:00Z", "bytes": 7}
+    assert side["IMG-2.jpg"]["asset_id"] == "a2"
+
+
+def test_download_skips_unchanged(lib, tmp_path):
+    _dl(tmp_path)
+    lib.calls.clear()
+    out = _dl(tmp_path)
+    assert lib.calls == []
+    assert out.splitlines()[0] == f"Saved 0 photos to {tmp_path}; 2 unchanged since the last download, not fetched again"
+    assert "Skipped 1 non-image" in out
+
+
+def test_download_redownloads_when_edited(lib, tmp_path):
+    _dl(tmp_path)
+    lib.calls.clear()
+    lib.items[1]["payload"]["develop"]["userUpdated"] = "2024-07-01T00:00:00Z"
+    out = _dl(tmp_path)
+    assert lib.calls == ["a2"]
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}; 1 unchanged since the last download, not fetched again"
+    side = json.loads((tmp_path / ".lr-mcp.json").read_text())
+    assert side["IMG-2.jpg"]["updated"] == "2024-07-01T00:00:00Z"
+
+
+def test_download_redownloads_other_size_deleted_file_or_force(lib, tmp_path):
+    _dl(tmp_path)
+    lib.calls.clear()
+    _dl(tmp_path, size="fullsize")
+    assert sorted(lib.calls) == ["a1", "a2"]
+    lib.calls.clear()
+    (tmp_path / "IMG.jpg").unlink()
+    _dl(tmp_path, size="fullsize")
+    assert lib.calls == ["a1"]
+    lib.calls.clear()
+    _dl(tmp_path, size="fullsize", force=True)
+    assert sorted(lib.calls) == ["a1", "a2"]
+
+
+def test_download_redownloads_truncated_file_or_missing_timestamp(lib, tmp_path):
+    del lib.items[0]["payload"]["develop"]
+    _dl(tmp_path)
+    lib.calls.clear()
+    (tmp_path / "IMG-2.jpg").write_bytes(b"x")
+    _dl(tmp_path)
+    assert sorted(lib.calls) == ["a1", "a2"]
+
+
+def test_download_ignores_corrupt_sidecar(lib, tmp_path):
+    (tmp_path / ".lr-mcp.json").write_text("{not json")
+    assert _dl(tmp_path).splitlines()[0] == f"Saved 2 photos to {tmp_path}"
+    assert set(json.loads((tmp_path / ".lr-mcp.json").read_text())) == {"IMG.jpg", "IMG-2.jpg"}
+
+
+def test_download_keeps_other_entries_and_skips_failures(lib, tmp_path):
+    (tmp_path / ".lr-mcp.json").write_text(json.dumps({"OTHER.jpg": {"asset_id": "z", "size": "640",
+                                                                       "updated": "t", "bytes": 1}}))
+    lib.fail.add("a2")
+    out = _dl(tmp_path)
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}"
+    assert "1 failed:\na2: generation timed out" in out
+    assert set(json.loads((tmp_path / ".lr-mcp.json").read_text())) == {"OTHER.jpg", "IMG.jpg"}
+    lib.fail.clear()
+    lib.calls.clear()
+    _dl(tmp_path)
+    assert lib.calls == ["a2"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_download_suffix_shift_does_not_skip_wrong_asset(tmp_path, lib):
+    server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
+    lib.calls.clear()
+    del lib.items[0]  # a1 left the selection: a2 now maps to IMG.jpg, whose entry belongs to a1
+    out = server.lr_download_photos(asset_ids=["a2"], size="2560", dest_dir=str(tmp_path))
+    assert lib.calls == ["a2"] and "unchanged" not in out
+
+
+def test_download_os_error_is_reported_and_others_recorded(tmp_path, lib, monkeypatch):
+    real = server.lr.rendition
+
+    def rendition(aid, size):
+        if aid == "a1":
+            raise OSError(28, "No space left on device")
+        return real(aid, size)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
+    assert "1 failed" in out and "a1: [Errno 28]" in out
+    assert set(server._read_sidecar(tmp_path)) == {"IMG-2.jpg"}
+
+
+def test_download_sidecar_write_failure_is_a_warning(tmp_path, lib, monkeypatch):
+    monkeypatch.setattr(server.os, "replace", lambda a, b: (_ for _ in ()).throw(OSError(13, "denied")))
+    out = server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
+    assert out.startswith("Saved 2 photos") and "Warning: could not write .lr-mcp.json" in out
+    assert not list(tmp_path.glob("*.tmp")) and not (tmp_path / server.SIDECAR).exists()

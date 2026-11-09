@@ -14,7 +14,7 @@ An unofficial MCP server for **Adobe Photoshop Lightroom** — the cloud-based L
 | `lr_list_photos` | Filter by album, capture date, time of day, rating, pick/reject flag, camera, lens, aperture, ISO, file name; album results keep the album's own (custom) order |
 | `lr_get_photo` | Capture info plus a summary of the photo's edit settings (XMP) |
 | `lr_view_photos` | Return edited JPEG renditions as images the model can see (up to 12) |
-| `lr_download_photos` | Save 640 – 2560 px or full-size JPEGs to disk |
+| `lr_download_photos` | Save 640 – 2560 px or full-size JPEGs to disk; when saving into the same folder again (album or explicit `dest_dir`), skips photos unchanged since the last run (`force` re-downloads) |
 | `lr_create_project_album` / `lr_add_to_project_album` / `lr_delete_project_album` | Manage project albums owned by this server |
 
 ### Limits of the Partner API
