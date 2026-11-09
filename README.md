@@ -11,8 +11,8 @@ An unofficial MCP server for **Adobe Photoshop Lightroom** — the cloud-based L
 | `lr_login` | Browser OAuth sign-in (only needed when tokens are missing or expired) |
 | `lr_account` | Subscription status and cloud storage usage |
 | `lr_list_albums` | Search albums by path and get their ids |
-| `lr_list_photos` | Filter by album, capture date, time of day, rating, pick/reject flag, camera, lens, aperture, ISO, file name; album results keep the album's own (custom) order |
-| `lr_get_photo` | Capture info plus a summary of the photo's edit settings (XMP) |
+| `lr_list_photos` | Filter by album, capture date, time of day, rating, pick/reject flag, camera, lens, aperture, ISO, file name; album results keep the album's own (custom) order. One line per photo: `id \| file \| captured \| rating \| flag \| exposure \| camera + lens \| title: … \| caption: …` (empty fields left out, title and caption cut to 60 characters) |
+| `lr_get_photo` | Capture info, title, caption, keywords, original and cropped size, orientation, GPS when present, plus a summary of the photo's edit settings (XMP) |
 | `lr_view_photos` | Return edited JPEG renditions as images the model can see (up to 12) |
 | `lr_download_photos` | Save 640 – 2560 px or full-size JPEGs to disk; when saving into the same folder again (album or explicit `dest_dir`), skips photos unchanged since the last run (`force` re-downloads) |
 | `lr_create_project_album` / `lr_add_to_project_album` / `lr_delete_project_album` | Manage project albums owned by this server |

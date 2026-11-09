@@ -9,6 +9,7 @@
 import asyncio
 import itertools
 import json
+import math
 import os
 import re
 import sys
@@ -93,11 +94,43 @@ def _latest(d, key):
     return v.get(key)
 
 
+def _text(v, depth=0):
+    """A dc string: plain, a language alternative {"x-default": ...}, {"description": ...} or a
+    one-element list of those; whitespace and '|' collapsed so it stays on one line."""
+    if isinstance(v, list):
+        v = v[0] if v else None
+    if isinstance(v, dict) and depth < 2:
+        xd = v.get("x-default")
+        v = xd if isinstance(xd, str) and xd.strip() else next((x for x in v.values() if _text(x, depth + 1)), None)
+        return _text(v, depth + 1)
+    return (" ".join(v.replace("|", "/").split()) or None) if isinstance(v, str) else None
+
+
+def _keywords(v):
+    """dc.subject as a list of strings or a {keyword: true} map."""
+    if isinstance(v, dict):
+        v = [k for k, on in v.items() if on]
+    if isinstance(v, str):
+        v = [v]
+    kw = [t for t in (_text(x) for x in v or []) if t] if isinstance(v, list) else []
+    return ", ".join(kw) or None
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _clip(v, n=60):
+    return v if len(v) <= n else v[:n - 1] + "…"
+
+
 def _summary(asset):
     p = asset.get("payload", {})
-    exif = p.get("xmp", {}).get("exif", {})
-    tiff = p.get("xmp", {}).get("tiff", {})
-    imp = p.get("importSource", {})
+    xmp = p.get("xmp") or {}
+    exif, tiff, dc = xmp.get("exif") or {}, xmp.get("tiff") or {}, xmp.get("dc") or {}
+    dev, loc, imp = p.get("develop") or {}, p.get("location") or {}, p.get("importSource") or {}
+    cw, ch = dev.get("croppedWidth"), dev.get("croppedHeight")
+    lat, lon = loc.get("latitude"), loc.get("longitude")
     shutter = exif.get("ExposureTime")
     if isinstance(shutter, list) and len(shutter) == 2 and shutter[1]:
         shutter = f"{shutter[0]}/{shutter[1]}" if shutter[0] < shutter[1] else f"{shutter[0] / shutter[1]:g}"
@@ -111,12 +144,18 @@ def _summary(asset):
         "rating": _latest(p.get("ratings"), "rating"),
         "flag": _latest(p.get("reviews"), "flag"),
         "camera": " ".join(filter(None, [tiff.get("Make"), tiff.get("Model")])) or None,
-        "lens": p.get("xmp", {}).get("aux", {}).get("Lens"),
+        "lens": (xmp.get("aux") or {}).get("Lens"),
         "iso": exif.get("ISOSpeedRatings"),
-        "aperture": f"f/{fnum:g}" if isinstance(fnum, (int, float)) else None,
+        "aperture": f"f/{fnum:g}" if _num(fnum) else None,
         "shutter": shutter,
-        "focal_mm": round(focal) if isinstance(focal, (int, float)) else None,
+        "focal_mm": round(focal) if _num(focal) else None,
         "size": f"{imp.get('originalWidth')}x{imp.get('originalHeight')}" if imp.get("originalWidth") else None,
+        "cropped": f"{round(cw)}x{round(ch)}" if _num(cw) and _num(ch) else None,
+        "orientation": dev.get("userOrientation") if _num(dev.get("userOrientation")) else None,
+        "gps": f"{lat},{lon}" if _num(lat) and _num(lon) else None,
+        "title": _text(dc.get("title")),
+        "caption": _text(dc.get("description")),
+        "keywords": _keywords(dc.get("subject")),
     }
 
 
@@ -132,6 +171,9 @@ def _fmt(s):
         bits.append(exp)
     if s["camera"]:
         bits.append(s["camera"] + (f" + {s['lens']}" if s["lens"] else ""))
+    for k in ("title", "caption"):
+        if s.get(k):
+            bits.append(f"{k}: {_clip(s[k])}")
     return " | ".join(bits)
 
 
@@ -152,8 +194,9 @@ def _iter_assets(album_id, captured_after, captured_before):
 
 
 def _fnumber(asset):
-    v = _frac(asset.get("payload", {}).get("xmp", {}).get("exif", {}).get("FNumber"))
-    return v if isinstance(v, (int, float)) else None
+    xmp = (asset.get("payload") or {}).get("xmp") or {}
+    v = _frac((xmp.get("exif") or {}).get("FNumber"))
+    return v if _num(v) else None
 
 
 def _in_hours(captured, hour_from, hour_to):
@@ -259,7 +302,8 @@ def lr_list_photos(
     Photos without the needed capture time or f-number are excluded when these are set.
     A scan stops after 20000 assets or 60 s; the first line then says the results are partial,
     so on a large catalog narrow with captured_after up front.
-    Each line: id | file | captured | rating | flag | exposure | camera + lens"""
+    Each line: id | file | captured | rating | flag | exposure | camera + lens | title: ... | caption: ...
+    Empty fields are left out; title and caption are cut to 60 characters (lr_get_photo has them in full)."""
     if sort not in ("album", "captured"):
         raise LrError("sort must be 'album' or 'captured'")
     if limit < 1:
@@ -333,7 +377,9 @@ def lr_list_photos(
 
 @mcp.tool()
 def lr_get_photo(asset_id: str, include_develop: bool = True) -> str:
-    """Details for one photo: capture info, rating/flag, original file, and a summary of its edits."""
+    """Details for one photo: capture info, rating/flag, title, caption, keywords, original file,
+    original and cropped pixel size, orientation (EXIF value; 6 and 8 are 90-degree rotations; the
+    sizes are as stored and are not swapped for it), GPS when present, and a summary of its edits."""
     a = lr.get_json(lr.catalog_path() + f"assets/{asset_id}")
     s = _summary(a)
     lines = [f"{k}: {v}" for k, v in s.items() if v is not None]
@@ -380,8 +426,8 @@ def _edited(asset):
     """Edit timestamp for the download cache. develop.userUpdated moves only when develop
     settings (incl. crop) change, so rating/flag edits don't force a re-download; fall back to
     the asset-wide userUpdated, then changedAtTime. None means always re-download."""
-    p = asset.get("payload", {})
-    return p.get("develop", {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
+    p = asset.get("payload") or {}
+    return (p.get("develop") or {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
 
 
 def _read_sidecar(dest):

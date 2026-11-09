@@ -237,6 +237,102 @@ def test_list_photos_album_cap_note_has_no_date_hint(monkeypatch):
     assert head == "0 photos (scanned 2, album order: captureDateAsc, scan limit reached — results are partial)"
 
 
+def test_summary_metadata_missing():
+    a = asset("a1", "2024-05-01T10:00:00")
+    s = server._summary(a)
+    for k in ("title", "caption", "keywords", "cropped", "orientation", "gps"):
+        assert s[k] is None
+    assert server._fmt(s) == "a1 | IMG.ARW | 2024-05-01T10:00:00 | f/2.8 1/250s ISO100 35mm | SONY ILCE-7M4 + FE 35mm F1.4 GM"
+    a["payload"]["xmp"]["dc"] = {"title": "  ", "description": {}, "subject": []}
+    a["payload"]["location"] = {"direction": 120.5}
+    assert all(server._summary(a)[k] is None for k in ("title", "caption", "keywords", "gps"))
+
+
+@pytest.mark.parametrize("caption", [
+    "Harbour at dusk",
+    {"description": "Harbour at dusk"},
+    {"x-default": "Harbour at dusk"},
+    "Harbour\n  at\tdusk ",
+])
+def test_summary_caption_forms(caption):
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["xmp"]["dc"] = {"title": "Busan", "description": caption}
+    s = server._summary(a)
+    assert s["title"] == "Busan"
+    assert s["caption"] == "Harbour at dusk"
+
+
+@pytest.mark.parametrize("subject, expected", [
+    (["sea", "night"], "sea, night"),
+    ({"sea": True, "night": True, "old": False}, "sea, night"),
+    ("sea", "sea"),
+])
+def test_summary_keywords(subject, expected):
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["xmp"]["dc"] = {"subject": subject}
+    assert server._summary(a)["keywords"] == expected
+
+
+def test_summary_crop_orientation_gps():
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["develop"] = {"croppedWidth": 5400, "croppedHeight": 3037.6, "userOrientation": 8}
+    a["payload"]["location"] = {"latitude": 35.1, "longitude": 129.04, "direction": 90}
+    s = server._summary(a)
+    assert (s["cropped"], s["orientation"], s["gps"], s["size"]) == ("5400x3038", 8, "35.1,129.04", "6000x4000")
+
+
+def test_fmt_appends_title_and_caption():
+    a = asset("a1", "2024-05-01T10:00:00", rating=3)
+    a["payload"]["xmp"]["dc"] = {"title": "Busan\nnight", "description": {"x-default": "word " * 30}}
+    s = server._summary(a)
+    line = server._fmt(s)
+    assert "\n" not in line
+    assert line.startswith("a1 | IMG.ARW | 2024-05-01T10:00:00 | ★★★ | f/2.8 1/250s ISO100 35mm"
+                           " | SONY ILCE-7M4 + FE 35mm F1.4 GM | title: Busan night | caption: word word")
+    caption = line.split(" | caption: ")[1]
+    assert len(caption) == 60 and caption.endswith("…")
+    s["title"] = None
+    assert " | title: " not in server._fmt(s) and " | caption: " in server._fmt(s)
+
+
+def test_get_photo_lists_metadata(monkeypatch):
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["xmp"]["dc"] = {"title": "Busan", "subject": ["sea"]}
+    a["payload"]["develop"] = {"croppedWidth": 4000, "croppedHeight": 3000, "userOrientation": 1}
+    monkeypatch.setattr(server.lr, "get_json", lambda path: a)
+    lines = server.lr_get_photo("a1", include_develop=False).splitlines()
+    assert {"title: Busan", "keywords: sea", "cropped: 4000x3000", "orientation: 1"} <= set(lines)
+    assert not any(l.startswith(("caption:", "gps:")) for l in lines)
+
+
+def test_summary_survives_null_sections_and_odd_numbers():
+    a = asset("a1", "2024-05-01T12:00:00")
+    a["payload"]["develop"] = {"croppedWidth": float("nan"), "croppedHeight": 10, "userOrientation": float("inf")}
+    a["payload"]["location"] = None
+    a["payload"]["xmp"]["dc"] = None
+    s = server._summary(a)
+    assert s["cropped"] is None and s["orientation"] is None and s["gps"] is None and s["title"] is None
+    a["payload"]["xmp"] = None
+    s = server._summary(a)
+    assert s["lens"] is None and s["aperture"] is None and server._fnumber(a) is None
+    a["payload"]["xmp"] = {"exif": {"FocalLength": float("inf"), "FNumber": float("nan")}, "aux": None}
+    s = server._summary(a)
+    assert s["focal_mm"] is None and s["aperture"] is None and s["lens"] is None
+
+
+@pytest.mark.parametrize("value, expected", [
+    ({"x-default": "  ", "en": "Hi"}, "Hi"),
+    ({"description": {"x-default": "nested"}}, "nested"),
+    (["first", "second"], "first"),
+    ([{"x-default": "in list"}], "in list"),
+    ("Busan | night", "Busan / night"),
+    ([], None),
+    ({"x-default": ""}, None),
+])
+def test_text_handles_alternative_shapes(value, expected):
+    assert server._text(value) == expected
+
+
 def _album(monkeypatch, mode, items):
     """items: (asset, order) pairs as album-asset resources; the album has assetSortOrder=mode."""
     gets = []
@@ -479,3 +575,8 @@ def test_download_sidecar_write_failure_is_a_warning(tmp_path, lib, monkeypatch)
     out = server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
     assert out.startswith("Saved 2 photos") and "Warning: could not write .lr-mcp.json" in out
     assert not list(tmp_path.glob("*.tmp")) and not (tmp_path / server.SIDECAR).exists()
+
+
+def test_edited_survives_null_develop():
+    assert server._edited({"id": "x", "payload": {"develop": None, "userUpdated": "2024-01-01T00:00:00Z"}}) == "2024-01-01T00:00:00Z"
+    assert server._edited({"id": "x", "payload": None}) is None
