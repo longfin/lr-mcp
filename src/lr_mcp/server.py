@@ -65,7 +65,8 @@ SORT_MODES = ("captureDateAsc", "captureDateDesc", "customAsc")
 
 
 def _album_sort_order(album_id):
-    """payload.assetSortOrder of one album: captureDateAsc | captureDateDesc | customAsc."""
+    """payload.assetSortOrder of one album: captureDateAsc | captureDateDesc | customAsc, or an
+    unknown value passed through as-is (captureDateAsc when missing)."""
     ts, items = _albums_cache
     a = next((a for a in items or [] if a["id"] == album_id), None) if time.time() - ts <= ALBUM_TTL else None
     if a is None:
@@ -317,9 +318,9 @@ def lr_list_photos(
     out = [s for s, _ in out[:limit]]
     note = ", limit reached" if len(out) >= limit else ""
     if album_id:
-        note = f", album order: {mode}" + (", sorted by capture" if sort == "captured" else "") + note
-        if mode not in SORT_MODES:
-            note = f", album order: {mode} (unsupported, sorted by capture)" + note[len(f", album order: {mode}"):]
+        label = mode if mode in SORT_MODES else f"{mode} (unsupported, sorted by capture)"
+        by_capture = sort == "captured" and mode in SORT_MODES
+        note = f", album order: {label}" + (", sorted by capture" if by_capture else "") + note
     if partial:
         note += f", {partial} — results are partial"
         if not album_id:

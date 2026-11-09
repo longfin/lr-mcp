@@ -344,6 +344,8 @@ def test_list_photos_flags_unsupported_album_order(monkeypatch):
     out = server.lr_list_photos(album_id="x")
     assert out.splitlines()[0] == "2 photos (scanned 2, album order: fileNameAsc (unsupported, sorted by capture))"
     assert _ids(out) == ["a", "b"]
+    out = server.lr_list_photos(album_id="x", sort="captured", limit=1)
+    assert out.splitlines()[0] == "1 photos (scanned 2, album order: fileNameAsc (unsupported, sorted by capture), limit reached)"
 
 
 def test_list_photos_rejects_bad_limit():
