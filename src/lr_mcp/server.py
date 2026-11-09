@@ -124,11 +124,11 @@ def _summary(asset):
         "rating": _latest(p.get("ratings"), "rating"),
         "flag": _latest(p.get("reviews"), "flag"),
         "camera": " ".join(filter(None, [tiff.get("Make"), tiff.get("Model")])) or None,
-        "lens": p.get("xmp", {}).get("aux", {}).get("Lens"),
+        "lens": (xmp.get("aux") or {}).get("Lens"),
         "iso": exif.get("ISOSpeedRatings"),
-        "aperture": f"f/{fnum:g}" if isinstance(fnum, (int, float)) else None,
+        "aperture": f"f/{fnum:g}" if _num(fnum) else None,
         "shutter": shutter,
-        "focal_mm": round(focal) if isinstance(focal, (int, float)) else None,
+        "focal_mm": round(focal) if _num(focal) else None,
         "size": f"{imp.get('originalWidth')}x{imp.get('originalHeight')}" if imp.get("originalWidth") else None,
         "cropped": f"{round(cw)}x{round(ch)}" if _num(cw) and _num(ch) else None,
         "orientation": dev.get("userOrientation") if _num(dev.get("userOrientation")) else None,
@@ -171,8 +171,9 @@ def _iter_assets(album_id, captured_after, captured_before):
 
 
 def _fnumber(asset):
-    v = _frac(asset.get("payload", {}).get("xmp", {}).get("exif", {}).get("FNumber"))
-    return v if isinstance(v, (int, float)) else None
+    xmp = (asset.get("payload") or {}).get("xmp") or {}
+    v = _frac((xmp.get("exif") or {}).get("FNumber"))
+    return v if _num(v) else None
 
 
 def _in_hours(captured, hour_from, hour_to):

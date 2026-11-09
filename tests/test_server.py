@@ -309,6 +309,12 @@ def test_summary_survives_null_sections_and_odd_numbers():
     a["payload"]["xmp"]["dc"] = None
     s = server._summary(a)
     assert s["cropped"] is None and s["orientation"] is None and s["gps"] is None and s["title"] is None
+    a["payload"]["xmp"] = None
+    s = server._summary(a)
+    assert s["lens"] is None and s["aperture"] is None and server._fnumber(a) is None
+    a["payload"]["xmp"] = {"exif": {"FocalLength": float("inf"), "FNumber": float("nan")}, "aux": None}
+    s = server._summary(a)
+    assert s["focal_mm"] is None and s["aperture"] is None and s["lens"] is None
 
 
 @pytest.mark.parametrize("value, expected", [
