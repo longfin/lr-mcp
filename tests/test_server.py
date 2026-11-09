@@ -30,6 +30,8 @@ def asset(aid, captured, file="IMG.ARW", rating=None, flag=None, iso=100):
 def catalog(monkeypatch):
     monkeypatch.setattr(server.lr, "catalog_path", lambda: "/v2/catalogs/c/")
     server._albums_cache = (0.0, None)
+    server._album_cache.clear()
+    monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {}})
 
 
 def test_summary():
@@ -232,7 +234,124 @@ def test_list_photos_album_cap_note_has_no_date_hint(monkeypatch):
     items = [asset(f"a{i}", "2024-05-01T12:00:00") for i in range(3)]
     monkeypatch.setattr(server.lr, "paginate", lambda path: ({"asset": a} for a in items))
     head = server.lr_list_photos(album_id="x", flag="reject").splitlines()[0]
-    assert head == "0 photos (scanned 2, scan limit reached — results are partial)"
+    assert head == "0 photos (scanned 2, album order: captureDateAsc, scan limit reached — results are partial)"
+
+
+def _album(monkeypatch, mode, items):
+    """items: (asset, order) pairs as album-asset resources; the album has assetSortOrder=mode."""
+    gets = []
+
+    def get_json(path):
+        gets.append(path)
+        return {"id": "x", "payload": {"assetSortOrder": mode} if mode else {}}
+
+    monkeypatch.setattr(server.lr, "get_json", get_json)
+    monkeypatch.setattr(server.lr, "paginate", lambda path: (
+        {"asset": a, "payload": {"order": o} if o else {}} for a, o in items))
+    return gets
+
+
+ALBUM = [
+    (asset("b", "2024-05-02T00:00:00"), "V--A"),
+    (asset("nokey1", "2024-05-05T00:00:00"), None),
+    (asset("c", "2024-05-01T00:00:00"), "V--K"),
+    (asset("nokey2", "2024-05-04T00:00:00"), None),
+    (asset("a", "2024-05-03T00:00:00"), "V--3"),
+]
+
+
+def test_list_photos_album_custom_order(monkeypatch):
+    gets = _album(monkeypatch, "customAsc", ALBUM)
+    out = server.lr_list_photos(album_id="x")
+    assert _ids(out) == ["a", "b", "c", "nokey2", "nokey1"]  # missing order last, by capture
+    assert out.splitlines()[0] == "5 photos (scanned 5, album order: customAsc)"
+    assert gets == ["/v2/catalogs/c/albums/x"]
+    server.lr_list_photos(album_id="x")
+    assert len(gets) == 1  # cached
+
+
+def test_list_photos_album_uses_cached_album_listing(monkeypatch):
+    gets = _album(monkeypatch, None, ALBUM)
+    server._albums_cache = (server.time.time(), [{"id": "x", "payload": {"assetSortOrder": "customAsc"}}])
+    assert _ids(server.lr_list_photos(album_id="x"))[:3] == ["a", "b", "c"]
+    assert gets == []
+
+
+def test_list_photos_album_capture_desc(monkeypatch):
+    _album(monkeypatch, "captureDateDesc", ALBUM)
+    out = server.lr_list_photos(album_id="x")
+    assert _ids(out) == ["nokey1", "nokey2", "a", "b", "c"]
+    assert "album order: captureDateDesc" in out.splitlines()[0]
+
+
+@pytest.mark.parametrize("mode", ["captureDateAsc", None])
+def test_list_photos_album_capture_asc_default(monkeypatch, mode):
+    _album(monkeypatch, mode, ALBUM)
+    out = server.lr_list_photos(album_id="x")
+    assert _ids(out) == ["c", "b", "a", "nokey2", "nokey1"]
+    assert "album order: captureDateAsc" in out.splitlines()[0]
+
+
+def test_list_photos_sort_captured_overrides_album(monkeypatch):
+    _album(monkeypatch, "customAsc", ALBUM)
+    out = server.lr_list_photos(album_id="x", sort="captured")
+    assert _ids(out) == ["c", "b", "a", "nokey2", "nokey1"]
+    assert out.splitlines()[0] == "5 photos (scanned 5, album order: customAsc, sorted by capture)"
+
+
+def test_list_photos_album_limit_after_sort(monkeypatch):
+    _album(monkeypatch, "customAsc", ALBUM)
+    out = server.lr_list_photos(album_id="x", limit=2)
+    assert _ids(out) == ["a", "b"]  # not the first two by API page order
+    assert out.splitlines()[0] == "2 photos (scanned 5, album order: customAsc, limit reached)"
+    assert _ids(server.lr_list_photos(album_id="x", sort="captured", limit=2)) == ["c", "b"]
+
+
+def test_list_photos_sort_ignored_without_album(monkeypatch):
+    items = [asset("a0", "2024-05-01T12:00:00"), asset("a1", "2024-05-02T12:00:00")]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(items))
+    monkeypatch.setattr(server.lr, "get_json", lambda path: pytest.fail("no album lookup"))
+    out = server.lr_list_photos(captured_after="2024-05-01", sort="captured")
+    assert out.splitlines()[0] == "2 photos (scanned 2)"
+    assert _ids(out) == ["a0", "a1"]
+
+
+def test_list_photos_rejects_bad_sort():
+    with pytest.raises(LrError, match="sort"):
+        server.lr_list_photos(album_id="x", sort="custom")
+
+
+def test_album_sort_order_ignores_stale_album_list(monkeypatch):
+    stale = [{"id": "x", "payload": {"assetSortOrder": "captureDateAsc"}}]
+    monkeypatch.setattr(server, "_albums_cache", (server.time.time() - server.ALBUM_TTL - 1, stale))
+    monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {"assetSortOrder": "customAsc"}})
+    assert server._album_sort_order("x") == "customAsc"
+    monkeypatch.setattr(server, "_albums_cache", (server.time.time(), stale))
+    server._album_cache.clear()
+    assert server._album_sort_order("x") == "captureDateAsc"
+
+
+def test_list_photos_coerces_non_string_order_keys(monkeypatch):
+    monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {"assetSortOrder": "customAsc"}})
+    items = [({"order": 3}, asset("int", "2024-05-01T12:00:00")), ({"order": "V--A"}, asset("str", "2024-05-01T12:01:00"))]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: ({"asset": a, "payload": o} for o, a in items))
+    assert _ids(server.lr_list_photos(album_id="x")) == ["int", "str"]
+
+
+def test_list_photos_flags_unsupported_album_order(monkeypatch):
+    monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {"assetSortOrder": "fileNameAsc"}})
+    items = [asset("b", "2024-05-02T12:00:00"), asset("a", "2024-05-01T12:00:00")]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: ({"asset": a} for a in items))
+    out = server.lr_list_photos(album_id="x")
+    assert out.splitlines()[0] == "2 photos (scanned 2, album order: fileNameAsc (unsupported, sorted by capture))"
+    assert _ids(out) == ["a", "b"]
+    out = server.lr_list_photos(album_id="x", sort="captured", limit=1)
+    assert out.splitlines()[0] == "1 photos (scanned 2, album order: fileNameAsc (unsupported, sorted by capture), limit reached)"
+
+
+def test_list_photos_rejects_bad_limit():
+    with pytest.raises(LrError, match="limit"):
+        server.lr_list_photos(album_id="x", limit=0)
 
 
 @pytest.fixture
