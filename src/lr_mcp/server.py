@@ -59,6 +59,21 @@ def _album_paths():
     return {aid: path(a) for aid, a in items.items()}
 
 
+_album_cache = {}
+
+
+def _album_sort_order(album_id):
+    """payload.assetSortOrder of one album: captureDateAsc | captureDateDesc | customAsc."""
+    ts, items = _albums_cache
+    a = next((a for a in items or [] if a["id"] == album_id), None)
+    if a is None:
+        ts, a = _album_cache.get(album_id, (0.0, None))
+        if a is None or time.time() - ts > 300:
+            a = lr.get_json(lr.catalog_path() + f"albums/{album_id}")
+            _album_cache[album_id] = (time.time(), a)
+    return a.get("payload", {}).get("assetSortOrder") or "captureDateAsc"
+
+
 def _frac(v):
     if isinstance(v, list) and len(v) == 2 and v[1]:
         return v[0] / v[1]
@@ -116,16 +131,18 @@ def _fmt(s):
 
 
 def _iter_assets(album_id, captured_after, captured_before):
+    """Yield (asset, order); order is the album-asset payload.order sort key, None outside an album."""
     if album_id:
         for aa in lr.paginate(lr.catalog_path() + f"albums/{album_id}/assets?embed=asset&limit=500"):
-            yield aa["asset"]
+            yield aa["asset"], aa.get("payload", {}).get("order")
         return
     # the API rejects captured_after together with captured_before, so walk forward
     # from captured_after and let the caller stop at captured_before
     q = "assets?limit=500&subtype=image%3Bvideo"
     if captured_after:
         q += "&captured_after=" + captured_after
-    yield from lr.paginate(lr.catalog_path() + q)
+    for a in lr.paginate(lr.catalog_path() + q):
+        yield a, None
 
 
 def _fnumber(asset):
@@ -216,11 +233,16 @@ def lr_list_photos(
     hour_to: int | None = None,
     max_fnumber: float | None = None,
     min_fnumber: float | None = None,
+    sort: str = "album",
     limit: int = 100,
 ) -> str:
-    """List photos matching filters, oldest capture first.
+    """List photos matching filters, oldest capture first (in an album: the album's order, see sort).
     album_id: search inside one album; omit to search the whole catalog
     (then narrow it with captured_after).
+    sort (with album_id only): 'album' (default) keeps the album's own order as set in Lightroom
+    (custom order, or capture date ascending/descending); 'captured' forces oldest capture first.
+    The first line names the album's order, e.g. 'album order: customAsc'; limit applies after sorting.
+    Without album_id, sort is ignored and results are always oldest capture first.
     captured_after / captured_before: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SS'.
     min_rating: minimum star rating (1-5). flag: 'pick' or 'reject'.
     camera / lens / filename: case-insensitive substrings. min_iso: minimum ISO.
@@ -232,6 +254,8 @@ def lr_list_photos(
     A scan stops after 20000 assets or 60 s; the first line then says the results are partial,
     so on a large catalog narrow with captured_after up front.
     Each line: id | file | captured | rating | flag | exposure | camera + lens"""
+    if sort not in ("album", "captured"):
+        raise LrError("sort must be 'album' or 'captured'")
     for h in (hour_from, hour_to):
         if h is not None and not 0 <= h <= 23:
             raise LrError("hour_from and hour_to must be between 0 and 23")
@@ -239,9 +263,10 @@ def lr_list_photos(
         captured_after += "T00:00:00"
     if captured_before and len(captured_before) == 10:
         captured_before += "T23:59:59"
+    mode = _album_sort_order(album_id) if album_id else None
     out, scanned, partial = [], 0, None
     deadline = time.monotonic() + SCAN_SECONDS
-    for a in itertools.islice(_iter_assets(album_id, captured_after, captured_before), MAX_SCAN):
+    for a, order in itertools.islice(_iter_assets(album_id, captured_after, captured_before), MAX_SCAN):
         if time.monotonic() > deadline:
             partial = "time limit reached"
             break
@@ -273,16 +298,21 @@ def lr_list_photos(
             if f is None or (max_fnumber is not None and f > max_fnumber) \
                     or (min_fnumber is not None and f < min_fnumber):
                 continue
-        out.append(s)
-        if len(out) >= limit:
-            break
+        out.append((s, order))
+        if not album_id and len(out) >= limit:
+            break  # an album is sorted after the scan, so it is cut to limit only then
     else:
         # the loop ran out without a break: either the catalog ended or the scan cap did
         if scanned >= MAX_SCAN:
             partial = "scan limit reached"
     if album_id:
-        out.sort(key=lambda s: s["captured"] or "")
+        out.sort(key=lambda so: so[0]["captured"] or "", reverse=sort == "album" and mode == "captureDateDesc")
+        if sort == "album" and mode == "customAsc":
+            out.sort(key=lambda so: (so[1] is None, so[1] or ""))  # stable: ties keep capture order
+    out = [s for s, _ in out[:limit]]
     note = ", limit reached" if len(out) >= limit else ""
+    if album_id:
+        note = f", album order: {mode}" + (", sorted by capture" if sort == "captured" else "") + note
     if partial:
         note += f", {partial} — results are partial"
         if not album_id:
