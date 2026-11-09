@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import ssl
 import subprocess
 import time
@@ -205,6 +206,19 @@ def access_token():
 # ---------------------------------------------------------------- http
 
 GET_ATTEMPTS = 6
+REQUEST_TIMEOUT = 30          # seconds without data on the socket before an attempt is abandoned
+RETRY_STATUSES = {429, 502, 503, 504}
+
+
+def _permanent(e):
+    """DNS and certificate failures: retrying cannot help, so fail at once (keeps `doctor` fast offline)."""
+    return isinstance(getattr(e, "reason", e), (socket.gaierror, ssl.SSLCertVerificationError))
+
+
+def _retry_after(headers, attempt):
+    """Server-suggested delay (seconds, capped at 30), else the backoff 1, 3, 5, 7, 9 s."""
+    v = (headers.get("Retry-After") or "").strip()
+    return min(int(v), 30) if v.isdigit() else 1 + 2 * attempt
 
 
 def request(method, path, body=None, content_type="application/json", auth=True, headers=None):
@@ -219,18 +233,24 @@ def request(method, path, body=None, content_type="application/json", auth=True,
     url = path if path.startswith("https://") else LR + path
     req = urllib.request.Request(url, method=method, data=data, headers=headers)
     # Adobe often drops the connection mid-body on large pages when requests overlap,
-    # so GETs (safe to repeat) are retried with backoff.
+    # so GETs (safe to repeat) are retried with backoff; writes get one attempt.
     attempts = GET_ATTEMPTS if method == "GET" else 1
     for attempt in range(attempts):
+        last = attempt + 1 == attempts
         try:
-            with urllib.request.urlopen(req) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            try:
+                with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                status, body = e.code, e.read()
+                if last or status not in RETRY_STATUSES:
+                    return status, body
+                delay = _retry_after(e.headers, attempt)
         except (http.client.HTTPException, urllib.error.URLError, OSError) as e:
-            if attempt + 1 == attempts:
-                raise LrError(f"{method} {url} failed after {attempts} attempts: {e!r}") from e
-            time.sleep(1 + 2 * attempt)
+            if last or _permanent(e):
+                raise LrError(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}") from e
+            delay = 1 + 2 * attempt
+        time.sleep(delay)
 
 
 def parse(body):

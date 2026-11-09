@@ -33,7 +33,8 @@ mcp = MCPServer(
 # ---------------------------------------------------------------- helpers
 
 _albums_cache = (0.0, None)
-MAX_SCAN = 20000  # assets lr_list_photos looks at before giving up
+MAX_SCAN = 20000   # assets lr_list_photos looks at before giving up
+SCAN_SECONDS = 90  # ...or the time it spends; MCP clients time tools out at about 120 s
 
 
 def _albums():
@@ -226,8 +227,12 @@ def lr_list_photos(
         captured_after += "T00:00:00"
     if captured_before and len(captured_before) == 10:
         captured_before += "T23:59:59"
-    out, scanned, capped = [], 0, False
+    out, scanned, partial = [], 0, None
+    deadline = time.monotonic() + SCAN_SECONDS
     for a in itertools.islice(_iter_assets(album_id, captured_after, captured_before), MAX_SCAN):
+        if time.monotonic() > deadline:
+            partial = "time limit reached"
+            break
         scanned += 1
         s = _summary(a)
         cap = (s["captured"] or "")[:19]
@@ -261,12 +266,13 @@ def lr_list_photos(
             break
     else:
         # the loop ran out without a break: either the catalog ended or the scan cap did
-        capped = scanned >= MAX_SCAN
+        if scanned >= MAX_SCAN:
+            partial = "scan limit reached"
     if album_id:
         out.sort(key=lambda s: s["captured"] or "")
     note = ", limit reached" if len(out) >= limit else ""
-    if capped:
-        note += ", scan limit reached — results are partial"
+    if partial:
+        note += f", {partial} — results are partial"
         if not album_id:
             note += "; narrow with captured_after"
     head = f"{len(out)} photos (scanned {scanned}{note})"
