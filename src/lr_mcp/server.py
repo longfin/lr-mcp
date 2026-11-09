@@ -34,7 +34,7 @@ mcp = MCPServer(
 
 _albums_cache = (0.0, None)
 MAX_SCAN = 20000   # assets lr_list_photos looks at before giving up
-SCAN_SECONDS = 90  # ...or the time it spends; MCP clients time tools out at about 120 s
+SCAN_SECONDS = 60  # ...or the time it spends, leaving room for one slow page; clients time out at ~120 s
 
 
 def _albums():
@@ -219,6 +219,8 @@ def lr_list_photos(
     max_fnumber / min_fnumber: f-number bounds, e.g. max_fnumber=2 for f/2 or wider,
     min_fnumber=8 for f/8 or narrower. Useful when lens info is missing (manual lenses).
     Photos without the needed capture time or f-number are excluded when these are set.
+    A scan stops after 20000 assets or 60 s; the first line then says the results are partial,
+    so on a large catalog narrow with captured_after up front.
     Each line: id | file | captured | rating | flag | exposure | camera + lens"""
     for h in (hour_from, hour_to):
         if h is not None and not 0 <= h <= 23:

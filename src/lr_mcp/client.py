@@ -17,6 +17,7 @@ import http.client
 import http.server
 import json
 import os
+import random
 import re
 import secrets
 import socket
@@ -211,14 +212,23 @@ RETRY_STATUSES = {429, 502, 503, 504}
 
 
 def _permanent(e):
-    """DNS and certificate failures: retrying cannot help, so fail at once (keeps `doctor` fast offline)."""
-    return isinstance(getattr(e, "reason", e), (socket.gaierror, ssl.SSLCertVerificationError))
+    """DNS and certificate failures: retrying cannot help, so fail at once (keeps `doctor` fast offline).
+    A temporary DNS failure (EAI_AGAIN) is still retried."""
+    reason = getattr(e, "reason", e)
+    if isinstance(reason, socket.gaierror):
+        return reason.errno != socket.EAI_AGAIN
+    return isinstance(reason, ssl.SSLCertVerificationError)
+
+
+def _backoff(attempt):
+    """1, 3, 5, 7, 9 s with ±50% jitter so parallel workers do not retry in lockstep."""
+    return (1 + 2 * attempt) * random.uniform(0.5, 1.5)
 
 
 def _retry_after(headers, attempt):
-    """Server-suggested delay (seconds, capped at 30), else the backoff 1, 3, 5, 7, 9 s."""
+    """Server-suggested delay (seconds, capped at 10 so a tool call stays within the client's timeout)."""
     v = (headers.get("Retry-After") or "").strip()
-    return min(int(v), 30) if v.isdigit() else 1 + 2 * attempt
+    return min(int(v), 10) if v.isascii() and v.isdigit() else _backoff(attempt)
 
 
 def request(method, path, body=None, content_type="application/json", auth=True, headers=None):
@@ -249,7 +259,7 @@ def request(method, path, body=None, content_type="application/json", auth=True,
         except (http.client.HTTPException, urllib.error.URLError, OSError) as e:
             if last or _permanent(e):
                 raise LrError(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}") from e
-            delay = 1 + 2 * attempt
+            delay = _backoff(attempt)
         time.sleep(delay)
 
 

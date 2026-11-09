@@ -81,6 +81,7 @@ def test_access_token_does_not_refresh_when_fresh(monkeypatch):
 def _client(monkeypatch):
     monkeypatch.setattr(lr, "access_token", lambda: "tok")
     monkeypatch.setattr(lr.time, "sleep", lambda s: None)
+    monkeypatch.setattr(lr.random, "uniform", lambda a, b: 1.0)  # no jitter, so sleeps are predictable
 
 
 def test_get_retries_incomplete_read(monkeypatch):
@@ -164,6 +165,55 @@ def _make_http_error(status, headers=None):
     return lr.urllib.error.HTTPError("https://x", status, "err", msg, io.BytesIO(b"err"))
 
 
+def test_get_retries_when_error_body_is_cut(monkeypatch):
+    _client(monkeypatch)
+    slept, calls = [], []
+    monkeypatch.setattr(lr.time, "sleep", slept.append)
+
+    def urlopen(req, timeout=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise lr.urllib.error.HTTPError("https://x", 500, "err", email.message.Message(), _Cut(b""))
+        return _Resp(b"ok")
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    assert lr.request("GET", "/v2/account") == (200, b"ok")
+    assert slept == [1]
+
+
+def test_backoff_has_jitter():
+    assert all(0.5 <= lr._backoff(0) <= 1.5 for _ in range(50))
+    assert 4.5 <= lr._backoff(4) <= 13.5
+
+
+def test_retry_after_is_capped_and_ignores_odd_values():
+    def hdr(v):
+        msg = email.message.Message()
+        if v is not None:
+            msg["Retry-After"] = v
+        return msg
+
+    assert lr._retry_after(hdr("7"), 0) == 7
+    assert lr._retry_after(hdr("120"), 0) == 10
+    for odd in ("²", "Wed, 21 Oct 2026 07:28:00 GMT", "-5", "", None):
+        assert 0.5 <= lr._retry_after(hdr(odd), 0) <= 1.5  # falls back to the first backoff step
+
+
+def test_temporary_dns_failure_is_retried(monkeypatch):
+    _client(monkeypatch)
+    calls = []
+
+    def urlopen(req, timeout=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise lr.urllib.error.URLError(lr.socket.gaierror(lr.socket.EAI_AGAIN, "try again"))
+        return _Resp(b"ok")
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    assert lr.request("GET", "/v2/account") == (200, b"ok")
+    assert calls == [1, 1]
+
+
 def test_get_retries_503_honouring_retry_after(monkeypatch):
     _client(monkeypatch)
     slept, calls = [], []
@@ -179,7 +229,7 @@ def test_get_retries_503_honouring_retry_after(monkeypatch):
 
     monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
     assert lr.request("GET", "/v2/account") == (200, b"ok")
-    assert slept == [7, 3]
+    assert slept == [7, 3]  # Retry-After, then plain backoff for the 429 without one
 
 
 def test_get_returns_other_http_errors_without_retry(monkeypatch):
