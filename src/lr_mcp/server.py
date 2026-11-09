@@ -60,18 +60,20 @@ def _album_paths():
 
 
 _album_cache = {}
+ALBUM_TTL = 60  # seconds an album's sort mode is trusted; the user may be reordering it right now
+SORT_MODES = ("captureDateAsc", "captureDateDesc", "customAsc")
 
 
 def _album_sort_order(album_id):
     """payload.assetSortOrder of one album: captureDateAsc | captureDateDesc | customAsc."""
     ts, items = _albums_cache
-    a = next((a for a in items or [] if a["id"] == album_id), None)
+    a = next((a for a in items or [] if a["id"] == album_id), None) if time.time() - ts <= ALBUM_TTL else None
     if a is None:
         ts, a = _album_cache.get(album_id, (0.0, None))
-        if a is None or time.time() - ts > 300:
+        if a is None or time.time() - ts > ALBUM_TTL:
             a = lr.get_json(lr.catalog_path() + f"albums/{album_id}")
             _album_cache[album_id] = (time.time(), a)
-    return a.get("payload", {}).get("assetSortOrder") or "captureDateAsc"
+    return (a.get("payload") or {}).get("assetSortOrder") or "captureDateAsc"
 
 
 def _frac(v):
@@ -134,7 +136,8 @@ def _iter_assets(album_id, captured_after, captured_before):
     """Yield (asset, order); order is the album-asset payload.order sort key, None outside an album."""
     if album_id:
         for aa in lr.paginate(lr.catalog_path() + f"albums/{album_id}/assets?embed=asset&limit=500"):
-            yield aa["asset"], aa.get("payload", {}).get("order")
+            order = (aa.get("payload") or {}).get("order")
+            yield aa["asset"], None if order is None else str(order)
         return
     # the API rejects captured_after together with captured_before, so walk forward
     # from captured_after and let the caller stop at captured_before
@@ -256,6 +259,8 @@ def lr_list_photos(
     Each line: id | file | captured | rating | flag | exposure | camera + lens"""
     if sort not in ("album", "captured"):
         raise LrError("sort must be 'album' or 'captured'")
+    if limit < 1:
+        raise LrError("limit must be at least 1")
     for h in (hour_from, hour_to):
         if h is not None and not 0 <= h <= 23:
             raise LrError("hour_from and hour_to must be between 0 and 23")
@@ -313,6 +318,8 @@ def lr_list_photos(
     note = ", limit reached" if len(out) >= limit else ""
     if album_id:
         note = f", album order: {mode}" + (", sorted by capture" if sort == "captured" else "") + note
+        if mode not in SORT_MODES:
+            note = f", album order: {mode} (unsupported, sorted by capture)" + note[len(f", album order: {mode}"):]
     if partial:
         note += f", {partial} — results are partial"
         if not album_id:
