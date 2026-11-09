@@ -354,9 +354,6 @@ def test_list_photos_rejects_bad_limit():
         server.lr_list_photos(album_id="x", limit=0)
 
 
-    assert head == "0 photos (scanned 2, scan limit reached — results are partial)"
-
-
 @pytest.fixture
 def lib(monkeypatch):
     """Two photos (same stem, so the second is IMG-2.jpg) and a video; counts rendition calls."""
