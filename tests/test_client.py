@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import time
 
 import pytest
@@ -149,3 +150,60 @@ def test_callback_server_reports_bad_port(monkeypatch):
 
 def test_parse_env():
     assert lr.parse_env("A=1\n# c\nB = '2'\nA=3\nlower=x") == {"A": "1", "B": "2"}
+
+
+def test_port_config():
+    assert lr.port_config(None) == (8000, False, None)
+    assert lr.port_config("") == (8000, False, None)
+    assert lr.port_config("  ") == (8000, False, None)
+    assert lr.port_config(" 8765 ") == (8765, True, None)
+    port, port_set, err = lr.port_config("x")
+    assert port_set and "not a number" in err
+
+
+class _NoTls:
+    def __init__(self, *a):
+        pass
+
+    def load_cert_chain(self, *a):
+        pass
+
+    def wrap_socket(self, sock, **k):
+        return sock
+
+
+@pytest.fixture
+def no_tls(monkeypatch):
+    monkeypatch.setattr(lr, "_ensure_cert", lambda: ("cert", "key"))
+    monkeypatch.setattr(lr.ssl, "SSLContext", _NoTls)
+
+
+def test_login_announces_port_fallback_before_opening_browser(monkeypatch, no_tls):
+    events = []
+
+    monkeypatch.setattr(lr.webbrowser, "open", lambda url: events.append(("browser", url)))
+    with _busy_port() as busy:
+        monkeypatch.setattr(lr, "PORT", busy.getsockname()[1])
+        monkeypatch.setattr(lr, "PORT_SET", False)
+        with pytest.raises(lr.LrError, match=r"not completed.*localhost:\[0-9\]\+/callback"):
+            lr.login(timeout=0, on_url=lambda u: events.append(("url", u)),
+                     on_notice=lambda m: events.append(("notice", m)))
+    assert [e for e, _ in events] == ["notice", "url", "browser"]
+    notice = events[0][1]
+    assert f"Port {lr.PORT} is busy" in notice and "https://localhost:[0-9]+/callback" in notice
+    used = int(re.search(r"using port (\d+)", notice).group(1))
+    assert used != lr.PORT and f"localhost%3A{used}%2Fcallback" in events[1][1]
+
+
+def test_login_is_quiet_on_default_port(monkeypatch, no_tls):
+    monkeypatch.setattr(lr.webbrowser, "open", lambda url: None)
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    monkeypatch.setattr(lr, "PORT", port)
+    monkeypatch.setattr(lr, "PORT_SET", False)
+    notices = []
+    with pytest.raises(lr.LrError, match=r"seconds\.$"):
+        lr.login(timeout=0, on_url=lambda u: None, on_notice=notices.append)
+    assert notices == []

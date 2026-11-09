@@ -150,9 +150,14 @@ def _now():
 async def lr_login() -> str:
     """Sign in to Adobe in the browser and store tokens. Only needed when another tool
     reports that the user is not signed in or the token refresh failed.
-    Waits up to 5 minutes for the user to finish signing in."""
-    tok = await asyncio.to_thread(lr.login, 300, lambda url: None)
-    return f"Signed in (refresh token: {'yes' if tok.get('refresh_token') else 'no'})."
+    Waits up to 5 minutes for the user to finish signing in.
+    The callback is https://localhost:8000/callback (or LR_MCP_PORT). If port 8000 is busy, another
+    port is used, which needs the redirect URI pattern https://localhost:[0-9]+/callback in the
+    Adobe console; with an older pattern such as https://localhost:8000/.* the browser lands on the
+    other app at :8000 and sign-in times out. The reply says when this happened."""
+    notices = []
+    tok = await asyncio.to_thread(lr.login, 300, lambda url: None, notices.append)
+    return " ".join([f"Signed in (refresh token: {'yes' if tok.get('refresh_token') else 'no'}).", *notices])
 
 
 @mcp.tool()

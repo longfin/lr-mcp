@@ -133,3 +133,21 @@ def test_cli_dispatch(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["lr-mcp", "setup", "--delete", "--from", "f.json"])
     with pytest.raises(SystemExit):
         server.main()
+
+
+def webapp_oauth2(cid, secret):
+    """The project JSON shape: the type sits next to an `oauth2` object."""
+    return {"integration_type": "oauthwebapp", "oauth2": {"client_id": cid, "client_secret": secret}}
+
+
+def test_finds_oauth_web_app_credential_next_to_integration_type():
+    other = {"integration_type": "service", "oauth2": {"client_id": "other", "client_secret": "x"}}
+    assert setup.find_credential(project(other, webapp_oauth2("cid", "sec"))) == ("cid", "sec")
+    assert setup.find_credential(project(webapp_oauth2("cid", "sec"), other)) == ("cid", "sec")
+    assert setup.find_credential(project(webapp_oauth2("cid", "sec"))) == ("cid", "sec")
+
+
+def test_integration_type_marks_only_its_own_credential():
+    other = {"integration_type": "service", "oauth2": {"client_id": "other", "client_secret": "x"}}
+    with pytest.raises(lr.LrError, match="2 credentials"):
+        setup.find_credential(project(other, {"jwt": {"client_id": "b", "client_secret": "y"}}))

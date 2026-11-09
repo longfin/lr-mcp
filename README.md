@@ -61,7 +61,7 @@ Each user needs their own credential: until Adobe reviews an integration it acce
 lr-mcp setup --from ~/Downloads/<credential>.json --delete
 ```
 
-`setup` needs lr-mcp 0.3.0 or later (`uv tool upgrade lr-mcp`). It reads the client ID and secret from the downloaded file (the project JSON from the project overview's **Download** also works) and writes `ADOBE_CLIENT_ID` and `ADOBE_CLIENT_SECRET` to `.env` in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). The file gets mode 600 and keeps any other lines. Only the first characters of the client ID are printed. `--delete` removes the downloaded file afterwards; without it, delete the file yourself.
+`setup` needs lr-mcp 0.3.0 or later (`uv tool upgrade lr-mcp`). It reads the client ID and secret from the downloaded file (the project JSON from the project overview's **Download** also works) and writes `ADOBE_CLIENT_ID` and `ADOBE_CLIENT_SECRET` to `.env` in the state directory, which `doctor` prints on its first line (`~/.config/lr-mcp/` by default). The file gets mode 600 and keeps any other lines. Only the first characters of the client ID are printed. `--delete` removes the downloaded file afterwards; without it, delete the file yourself. The MCP server reads `.env` only when it starts: if it is already registered in an MCP client (step 5), restart the client after `setup` (quit and reopen Claude Desktop, or start a new Claude Code session).
 
 | Variable | Required | Description |
 |---|---|---|
@@ -79,7 +79,7 @@ To keep the state somewhere else, set the environment variable `LR_MCP_HOME` to 
 lr-mcp login
 ```
 
-A browser window opens on the Adobe sign-in page. Sign in with the account added as a beta user and allow access. Adobe then redirects to `https://localhost:<port>/callback` (8000 unless it was busy), which uses a self-signed certificate, so the browser shows a certificate warning: choose **Advanced → Proceed to localhost** (Chrome) or **Show Details → visit this website** (Safari). The page then says "Signed in" and the terminal prints where the tokens were saved. Tokens are stored with mode 600 and refreshed automatically.
+A browser window opens on the Adobe sign-in page. If port 8000 is busy, `login` first prints which port it uses instead. Sign in with the account added as a beta user and allow access. Adobe then redirects to `https://localhost:<port>/callback` (8000 unless it was busy), which uses a self-signed certificate, so the browser shows a certificate warning: choose **Advanced → Proceed to localhost** (Chrome) or **Show Details → visit this website** (Safari). The page then says "Signed in" and the terminal prints where the tokens were saved. Tokens are stored with mode 600 and refreshed automatically.
 
 ### 4. Check
 
@@ -131,7 +131,7 @@ The client config can be added before or after signing in; without tokens the to
 | The Adobe sign-in page shows an error right away | Usually a wrong `ADOBE_CLIENT_ID`: `doctor` cannot verify it before sign-in. Run step 2 again with the right credential JSON. |
 | `doctor`: `rejected the client id` | `ADOBE_CLIENT_ID` is wrong or the tokens belong to another credential. Run step 2 again with the right credential JSON, then sign in again. |
 | `doctor`: `Lightroom API refused the account` | The signed-in account is not a beta user (step 1.4) or has no Lightroom plan. |
-| The browser lands on `https://localhost:8000/callback` although sign-in used another port (`login` times out and says which port it used) | Adobe silently falls back to the default redirect URI when the requested one does not match the pattern. Set the pattern to `https://localhost:[0-9]+/callback` (step 1.3; `\d` is not supported). Credentials set up with `https://localhost:8000/.*` need this change. |
+| The browser lands on `https://localhost:8000/callback` although sign-in used another port (`login` prints `Port 8000 is busy; using port …` before the browser opens) | Adobe silently falls back to the default redirect URI when the requested one does not match the pattern. Set the pattern to `https://localhost:[0-9]+/callback` (step 1.3; `\d` is not supported). Credentials set up with `https://localhost:8000/.*` need this change. |
 | The sign-in redirect shows another app's page or never loads | Something else listens on the port (`lsof -iTCP:<port> -sTCP:LISTEN`). Stop it, or set `LR_MCP_PORT` to a free port. |
 | `login` times out after 5 minutes | The browser stopped at the certificate warning; proceed past it next time. |
 | `Token refresh failed` | Run `lr-mcp login` again. |
@@ -146,6 +146,7 @@ If a user asks you to set this server up:
 - The user must create the credential, add the beta user, download the credential JSON, and finish the browser sign-in. Give them the exact console steps from step 1; the redirect URI values are the same for everyone.
 - Put only `LR_MCP_HOME` or `LR_MCP_PORT` in a client's `"env"` / `-e`, never `ADOBE_CLIENT_ID` or `ADOBE_CLIENT_SECRET`.
 - `lr-mcp login` blocks for up to 5 minutes while the user signs in; the `[human]` part is the browser sign-in. You may run it in the background, but first tell the user a browser window will open on their screen and warn them about the certificate page. Run `doctor` afterwards to confirm the sign-in.
+- The MCP server reads `.env` only when it starts. If the client already had the server registered and running when you ran `setup`, tell the user to restart the client (quit and reopen Claude Desktop, or start a new Claude Code session) before using the `lr_*` tools.
 - Setup is done when `doctor` prints `Catalog found. Setup is complete.` Add the client config (step 5) before or after that. If a `lightroom` entry already exists in the client, show the user what it runs and ask before replacing it. When reading `claude mcp get` output or `claude_desktop_config.json`, show only commands and env variable names, never env values: they may hold other servers' secrets. For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path from `which lr-mcp`, pass `LR_MCP_HOME` in `"env"` if it is set, and tell the user to quit and reopen the app. For Claude Code, register the absolute path and tell the user to start a new session.
 
 ## Development

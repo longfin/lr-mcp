@@ -19,15 +19,18 @@ def find_credential(data):
     {"client_id", "client_secret"} objects)."""
     found = []
 
-    def walk(node, key=None):
+    def walk(node, key=None, web_parent=False):
         if isinstance(node, dict):
+            # {"integration_type": "oauthwebapp", "oauth2": {...}} or {"oauthwebapp": {...}}
+            web_here = node.get("integration_type") == "oauthwebapp"
             cid = node.get("client_id") or node.get("API_KEY")
             secret = node.get("client_secret") or node.get("CLIENT_SECRET")
             if isinstance(cid, str) and isinstance(secret, str) and cid.strip() and secret.strip():
                 cid, secret = cid.strip(), secret.strip()
-                found.append((key == "oauthwebapp" or "DEF_REDIRECT_URI" in node, cid, secret))
+                web = web_here or web_parent or key == "oauthwebapp" or "DEF_REDIRECT_URI" in node
+                found.append((web, cid, secret))
             for k, v in node.items():
-                walk(v, k)
+                walk(v, k, web_here)
         elif isinstance(node, list):
             for v in node:
                 walk(v, key)

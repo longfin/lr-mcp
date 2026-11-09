@@ -173,3 +173,15 @@ def test_list_photos_fnumber(monkeypatch):
     assert _ids(server.lr_list_photos(album_id="x", min_fnumber=8)) == ["f8"]
     assert _ids(server.lr_list_photos(album_id="x", min_fnumber=2, max_fnumber=4)) == ["f2", "f4"]
     assert len(_ids(server.lr_list_photos(album_id="x"))) == 5
+
+
+def test_lr_login_reports_port_fallback(monkeypatch):
+    import asyncio
+
+    def login(timeout, on_url, on_notice):
+        on_notice("Port 8000 is busy; using port 54321.")
+        return {"refresh_token": "rt"}
+
+    monkeypatch.setattr(server.lr, "login", login)
+    out = asyncio.run(server.lr_login())
+    assert out.startswith("Signed in (refresh token: yes).") and "using port 54321" in out

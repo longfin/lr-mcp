@@ -37,7 +37,8 @@ def checks():
             return
         else:
             yield True, (f"Callback port {lr.PORT} is in use; sign-in will pick a free port, which needs "
-                         "the redirect URI pattern https://localhost:[0-9]+/callback in the Adobe console"), None
+                         "the redirect URI pattern https://localhost:[0-9]+/callback in the Adobe console "
+                         f"(with an older pattern, stop the app on port {lr.PORT} instead)"), None
 
     missing = [k for k in ("ADOBE_CLIENT_ID", "ADOBE_CLIENT_SECRET") if not os.environ.get(k)]
     if missing:

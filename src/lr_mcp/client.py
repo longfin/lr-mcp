@@ -67,14 +67,20 @@ def _load_env():
 
 # variables set before .env is loaded; they take precedence over anything written to .env
 SHELL_ENV = {k: os.environ[k] for k in ("ADOBE_CLIENT_ID", "ADOBE_CLIENT_SECRET") if k in os.environ}
+
+
+def port_config(raw):
+    """(port, set, error) for an LR_MCP_PORT value; empty or missing counts as unset.
+    Never raises: `setup` and `doctor` must still run to fix a bad value."""
+    raw = (raw or "").strip()
+    try:
+        return (int(raw), True, None) if raw else (8000, False, None)
+    except ValueError:
+        return 8000, True, f"LR_MCP_PORT is not a number: {raw!r}"
+
+
 _load_env()
-PORT_SET = "LR_MCP_PORT" in os.environ
-try:
-    PORT = int(os.environ.get("LR_MCP_PORT", "8000"))
-    PORT_ERROR = None
-except ValueError:
-    # don't fail at import: `setup` and `doctor` must still run to fix it
-    PORT, PORT_ERROR = 8000, f"LR_MCP_PORT is not a number: {os.environ['LR_MCP_PORT']!r}"
+PORT, PORT_SET, PORT_ERROR = port_config(os.environ.get("LR_MCP_PORT"))
 
 
 def client_id():
@@ -178,8 +184,15 @@ def _token_request(params):
     return tok
 
 
-def login(timeout=300, on_url=print):
-    """Browser OAuth login. Returns once the callback arrives or `timeout` seconds pass."""
+def port_notice(port):
+    return (f"Port {PORT} is busy; using port {port}. This needs the redirect URI pattern "
+            f"https://localhost:[0-9]+/callback in the Adobe console. If the browser lands on "
+            f"https://localhost:{PORT}/callback, stop the other app on port {PORT} or update the pattern.")
+
+
+def login(timeout=300, on_url=print, on_notice=print):
+    """Browser OAuth login. Returns once the callback arrives or `timeout` seconds pass.
+    `on_notice` gets a message before the browser opens when sign-in falls back to another port."""
     cid = client_id()
     _client_secret()
     state = secrets.token_urlsafe(16)
@@ -211,6 +224,8 @@ def login(timeout=300, on_url=print):
     ctx.load_cert_chain(cert, key)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     srv.timeout = 1
+    if port != PORT:
+        on_notice(port_notice(port))
 
     url = f"{IMS}/authorize/v2?" + urllib.parse.urlencode({
         "client_id": cid, "scope": SCOPES, "response_type": "code",
@@ -231,11 +246,7 @@ def login(timeout=300, on_url=print):
     if "error" in result:
         raise LrError(f"Authorization failed: {result}")
     if "code" not in result:
-        hint = ""
-        if port != PORT:
-            hint = (f" Port {PORT} was busy, so sign-in used port {port}. If the browser ended up on "
-                    f"https://localhost:{PORT}/callback instead, set the console's redirect URI pattern to "
-                    f"https://localhost:[0-9]+/callback, or free port {PORT}.")
+        hint = " " + port_notice(port) if port != PORT else ""
         raise LrError(f"Sign-in was not completed within {timeout} seconds.{hint}")
     if result.get("state") != state:
         raise LrError("OAuth state mismatch.")
