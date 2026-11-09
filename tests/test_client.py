@@ -1,6 +1,7 @@
 import email.message
 import io
 import json
+import re
 import time
 
 import pytest
@@ -76,6 +77,140 @@ def test_access_token_does_not_refresh_when_fresh(monkeypatch):
                                          "expires_in": 86400, "obtained_at": int(time.time())}))
     monkeypatch.setattr(lr.urllib.request, "urlopen", lambda req, timeout=None: pytest.fail("should not refresh"))
     assert lr.access_token() == "fresh"
+
+
+class _Ok(__import__("http.server").server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+def test_port_free_after_time_wait():
+    import http.server
+    import threading
+    import urllib.request
+    srv = http.server.HTTPServer(("localhost", 0), _Ok)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.handle_request)
+    t.start()
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/").read()
+    t.join()
+    srv.server_close()
+    assert lr.port_free(port)
+
+
+def test_listening_without_ipv6(monkeypatch):
+    import socket
+    real = socket.socket
+
+    def fake(family=socket.AF_INET, *a, **k):
+        if family == socket.AF_INET6:
+            raise OSError(97, "Address family not supported by protocol")
+        return real(family, *a, **k)
+
+    monkeypatch.setattr(socket, "socket", fake)
+    with real() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    assert not lr._listening(port)
+
+
+def _busy_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen()
+    return s
+
+
+def test_callback_server_falls_back_when_default_is_busy(monkeypatch):
+    with _busy_port() as busy:
+        monkeypatch.setattr(lr, "PORT", busy.getsockname()[1])
+        monkeypatch.setattr(lr, "PORT_SET", False)
+        srv = lr._callback_server(_Ok)
+        try:
+            assert srv.server_address[1] not in (0, lr.PORT)
+        finally:
+            srv.server_close()
+
+
+def test_callback_server_keeps_explicit_port(monkeypatch):
+    with _busy_port() as busy:
+        monkeypatch.setattr(lr, "PORT", busy.getsockname()[1])
+        monkeypatch.setattr(lr, "PORT_SET", True)
+        with pytest.raises(lr.LrError, match="LR_MCP_PORT"):
+            lr._callback_server(_Ok)
+
+
+def test_callback_server_reports_bad_port(monkeypatch):
+    monkeypatch.setattr(lr, "PORT_ERROR", "LR_MCP_PORT must be a port number 1-65535: 'x'")
+    with pytest.raises(lr.LrError, match="1-65535"):
+        lr._callback_server(_Ok)
+
+
+def test_parse_env():
+    assert lr.parse_env("A=1\n# c\nB = '2'\nA=3\nlower=x") == {"A": "1", "B": "2"}
+
+
+def test_port_config():
+    assert lr.port_config(None) == (8000, False, None)
+    assert lr.port_config("") == (8000, False, None)
+    assert lr.port_config("  ") == (8000, False, None)
+    assert lr.port_config(" 8765 ") == (8765, True, None)
+    for bad in ("x", "-1", "0", "70000", "1_000", "0x1F", "٨٠٠٠"):
+        port, port_set, err = lr.port_config(bad)
+        assert (port, port_set) == (8000, True) and "1-65535" in err, bad
+
+
+class _NoTls:
+    def __init__(self, *a):
+        pass
+
+    def load_cert_chain(self, *a):
+        pass
+
+    def wrap_socket(self, sock, **k):
+        return sock
+
+
+@pytest.fixture
+def no_tls(monkeypatch):
+    monkeypatch.setattr(lr, "_ensure_cert", lambda: ("cert", "key"))
+    monkeypatch.setattr(lr.ssl, "SSLContext", _NoTls)
+
+
+def test_login_announces_port_fallback_before_opening_browser(monkeypatch, no_tls):
+    events = []
+
+    monkeypatch.setattr(lr.webbrowser, "open", lambda url: events.append(("browser", url)))
+    with _busy_port() as busy:
+        monkeypatch.setattr(lr, "PORT", busy.getsockname()[1])
+        monkeypatch.setattr(lr, "PORT_SET", False)
+        with pytest.raises(lr.LrError, match=r"not completed.*localhost:\[0-9\]\+/callback"):
+            lr.login(timeout=0, on_url=lambda u: events.append(("url", u)),
+                     on_notice=lambda m: events.append(("notice", m)))
+    assert [e for e, _ in events] == ["notice", "url", "browser"]
+    notice = events[0][1]
+    assert f"Port {lr.PORT} is busy" in notice and "https://localhost:[0-9]+/callback" in notice
+    used = int(re.search(r"using port (\d+)", notice).group(1))
+    assert used != lr.PORT and f"localhost%3A{used}%2Fcallback" in events[1][1]
+
+
+def test_login_is_quiet_on_default_port(monkeypatch, no_tls):
+    monkeypatch.setattr(lr.webbrowser, "open", lambda url: None)
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    monkeypatch.setattr(lr, "PORT", port)
+    monkeypatch.setattr(lr, "PORT_SET", False)
+    notices = []
+    with pytest.raises(lr.LrError, match=r"seconds\.$"):
+        lr.login(timeout=0, on_url=lambda u: None, on_notice=notices.append)
+    assert notices == []
 
 
 def _client(monkeypatch):

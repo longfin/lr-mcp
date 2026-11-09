@@ -175,6 +175,18 @@ def test_list_photos_fnumber(monkeypatch):
     assert len(_ids(server.lr_list_photos(album_id="x"))) == 5
 
 
+def test_lr_login_reports_port_fallback(monkeypatch):
+    import asyncio
+
+    def login(timeout, on_url, on_notice):
+        on_notice("Port 8000 is busy; using port 54321.")
+        return {"refresh_token": "rt"}
+
+    monkeypatch.setattr(server.lr, "login", login)
+    out = asyncio.run(server.lr_login())
+    assert out.startswith("Signed in (refresh token: yes).") and "Port 8000 was busy" in out
+
+
 def test_list_photos_stops_at_scan_cap_without_matches(monkeypatch):
     monkeypatch.setattr(server, "MAX_SCAN", 5)
     pulled = []

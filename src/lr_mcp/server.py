@@ -3,6 +3,8 @@
 `lr-mcp`        run the stdio MCP server
 `lr-mcp login`  sign in from the terminal (opens a browser)
 `lr-mcp doctor` check the setup and say what to fix next
+`lr-mcp setup --from <file> [--delete]`
+                save the credential from a JSON file downloaded from the Adobe Developer Console
 """
 import asyncio
 import itertools
@@ -151,9 +153,17 @@ def _now():
 async def lr_login() -> str:
     """Sign in to Adobe in the browser and store tokens. Only needed when another tool
     reports that the user is not signed in or the token refresh failed.
-    Waits up to 5 minutes for the user to finish signing in."""
-    tok = await asyncio.to_thread(lr.login, 300, lambda url: None)
-    return f"Signed in (refresh token: {'yes' if tok.get('refresh_token') else 'no'})."
+    Waits up to 5 minutes for the user to finish signing in.
+    The callback is https://localhost:8000/callback (or LR_MCP_PORT). If port 8000 is busy, another
+    port is used, which needs the redirect URI pattern https://localhost:[0-9]+/callback in the
+    Adobe console; with an older pattern such as https://localhost:8000/.* the browser lands on the
+    other app at :8000 and sign-in times out. The reply says when this happened."""
+    notices = []
+    tok = await asyncio.to_thread(lr.login, 300, lambda url: None, notices.append)
+    msg = f"Signed in (refresh token: {'yes' if tok.get('refresh_token') else 'no'})."
+    if notices:
+        msg += f" Port {lr.PORT} was busy, so sign-in used a free port; nothing to fix since it worked."
+    return msg
 
 
 @mcp.tool()
@@ -446,6 +456,14 @@ def main():
     if sys.argv[1:] == ["doctor"]:
         from .doctor import run
         sys.exit(0 if run() else 1)
+    args = sys.argv[1:]
+    if len(args) >= 3 and args[:2] == ["setup", "--from"] and args[3:] in ([], ["--delete"]):
+        from .credentials import run
+        try:
+            run(args[2], delete=len(args) == 4)
+        except LrError as e:
+            sys.exit(str(e))
+        return
     if sys.argv[1:]:
         sys.exit(__doc__)
     mcp.run()
