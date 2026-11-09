@@ -8,6 +8,8 @@
 """
 import asyncio
 import itertools
+import json
+import os
 import re
 import sys
 import time
@@ -333,17 +335,52 @@ def lr_view_photos(asset_ids: list[str], size: str = "640") -> list:
     return out
 
 
+SIDECAR = ".lr-mcp.json"
+
+
+def _edited(asset):
+    """Edit timestamp for the download cache. develop.userUpdated moves only when develop
+    settings (incl. crop) change, so rating/flag edits don't force a re-download; fall back to
+    the asset-wide userUpdated, then changedAtTime. None means always re-download."""
+    p = asset.get("payload", {})
+    return p.get("develop", {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
+
+
+def _read_sidecar(dest):
+    try:
+        d = json.loads((dest / SIDECAR).read_text())
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_sidecar(dest, entries):
+    """Atomic write; returns an error string instead of raising, since the photos are already saved."""
+    tmp = dest / f"{SIDECAR}.{uuid.uuid4().hex}.tmp"
+    try:
+        tmp.write_text(json.dumps(entries, indent=1, sort_keys=True))
+        os.replace(tmp, dest / SIDECAR)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        return f"could not write {SIDECAR} ({e}); the next call will download these again"
+
+
 @mcp.tool()
 def lr_download_photos(
     asset_ids: list[str] | None = None,
     album_id: str | None = None,
     size: str = "2048",
     dest_dir: str | None = None,
+    force: bool = False,
 ) -> str:
     """Save photos as JPEG files. Pass either asset_ids or album_id (the whole album).
     size: '640' | '1280' | '2048' | '2560' | 'fullsize' (original resolution with edits; slower).
     dest_dir defaults to ~/Downloads/lightroom/<album name or export-timestamp>.
-    Files are named after the original file name with a .jpg extension."""
+    Files are named after the original file name with a .jpg extension.
+    <dest_dir>/.lr-mcp.json records what was saved; on the next call into the same folder, photos
+    whose file, size and edit time are unchanged are skipped. This needs a stable folder: album_id
+    or an explicit dest_dir (asset_ids alone get a new export-<timestamp> folder each time).
+    force=True re-downloads everything, e.g. if a saved file looks stale."""
     if size not in ("640", "1280", "2048", "2560", "fullsize"):
         raise LrError("size must be one of 640, 1280, 2048, 2560, fullsize")
     if album_id:
@@ -371,24 +408,50 @@ def lr_download_photos(
         used.add(stem)
         return dest / f"{stem}.jpg"
 
-    jobs = [(a["id"], target(a)) for a in assets if a.get("subtype") == "image"]
-    errors = []
+    cache = _read_sidecar(dest)
+
+    def fresh(aid, path, updated):
+        e = cache.get(path.name)
+        if force or not updated or not e or (e.get("asset_id"), e.get("size"), e.get("updated")) != (aid, size, updated):
+            return False
+        try:
+            return path.stat().st_size == e.get("bytes")
+        except OSError:
+            return False
+
+    jobs, unchanged = [], 0
+    for a in assets:
+        if a.get("subtype") != "image":
+            continue
+        aid, path, updated = a["id"], target(a), _edited(a)  # target() for every image keeps -2/-3 stable
+        if fresh(aid, path, updated):
+            unchanged += 1
+        else:
+            jobs.append((aid, path, updated))
+    errors, saved = [], {}
 
     def fetch(job):
-        aid, path = job
+        aid, path, updated = job
         try:
-            path.write_bytes(lr.rendition(aid, size))
-        except LrError as e:
+            data = lr.rendition(aid, size)
+            path.write_bytes(data)
+            saved[path.name] = {"asset_id": aid, "size": size, "updated": updated, "bytes": len(data)}
+        except (LrError, OSError) as e:
             errors.append(f"{aid}: {e}")
 
     with ThreadPoolExecutor(6) as ex:
         list(ex.map(fetch, jobs))
-    skipped = len(assets) - len(jobs)
-    msg = f"Saved {len(jobs) - len(errors)} photos to {dest}"
+    warning = _write_sidecar(dest, {**_read_sidecar(dest), **saved}) if saved else None
+    skipped = len(assets) - len(jobs) - unchanged
+    msg = f"Saved {len(saved)} photos to {dest}"
+    if unchanged:
+        msg += f"; {unchanged} unchanged since the last download, not fetched again"
     if skipped:
         msg += f"\nSkipped {skipped} non-image assets (videos etc.)"
     if errors:
         msg += f"\n{len(errors)} failed:\n" + "\n".join(errors[:20])
+    if warning:
+        msg += f"\nWarning: {warning}"
     return msg
 
 
