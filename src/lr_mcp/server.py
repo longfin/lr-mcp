@@ -8,7 +8,9 @@
 """
 import asyncio
 import itertools
+import json
 import math
+import os
 import re
 import sys
 import time
@@ -58,6 +60,24 @@ def _album_paths():
         return f"{path(items[parent])} / {name}" if parent in items else name
 
     return {aid: path(a) for aid, a in items.items()}
+
+
+_album_cache = {}
+ALBUM_TTL = 60  # seconds an album's sort mode is trusted; the user may be reordering it right now
+SORT_MODES = ("captureDateAsc", "captureDateDesc", "customAsc")
+
+
+def _album_sort_order(album_id):
+    """payload.assetSortOrder of one album: captureDateAsc | captureDateDesc | customAsc, or an
+    unknown value passed through as-is (captureDateAsc when missing)."""
+    ts, items = _albums_cache
+    a = next((a for a in items or [] if a["id"] == album_id), None) if time.time() - ts <= ALBUM_TTL else None
+    if a is None:
+        ts, a = _album_cache.get(album_id, (0.0, None))
+        if a is None or time.time() - ts > ALBUM_TTL:
+            a = lr.get_json(lr.catalog_path() + f"albums/{album_id}")
+            _album_cache[album_id] = (time.time(), a)
+    return (a.get("payload") or {}).get("assetSortOrder") or "captureDateAsc"
 
 
 def _frac(v):
@@ -158,16 +178,19 @@ def _fmt(s):
 
 
 def _iter_assets(album_id, captured_after, captured_before):
+    """Yield (asset, order); order is the album-asset payload.order sort key, None outside an album."""
     if album_id:
         for aa in lr.paginate(lr.catalog_path() + f"albums/{album_id}/assets?embed=asset&limit=500"):
-            yield aa["asset"]
+            order = (aa.get("payload") or {}).get("order")
+            yield aa["asset"], None if order is None else str(order)
         return
     # the API rejects captured_after together with captured_before, so walk forward
     # from captured_after and let the caller stop at captured_before
     q = "assets?limit=500&subtype=image%3Bvideo"
     if captured_after:
         q += "&captured_after=" + captured_after
-    yield from lr.paginate(lr.catalog_path() + q)
+    for a in lr.paginate(lr.catalog_path() + q):
+        yield a, None
 
 
 def _fnumber(asset):
@@ -259,11 +282,16 @@ def lr_list_photos(
     hour_to: int | None = None,
     max_fnumber: float | None = None,
     min_fnumber: float | None = None,
+    sort: str = "album",
     limit: int = 100,
 ) -> str:
-    """List photos matching filters, oldest capture first.
+    """List photos matching filters, oldest capture first (in an album: the album's order, see sort).
     album_id: search inside one album; omit to search the whole catalog
     (then narrow it with captured_after).
+    sort (with album_id only): 'album' (default) keeps the album's own order as set in Lightroom
+    (custom order, or capture date ascending/descending); 'captured' forces oldest capture first.
+    The first line names the album's order, e.g. 'album order: customAsc'; limit applies after sorting.
+    Without album_id, sort is ignored and results are always oldest capture first.
     captured_after / captured_before: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SS'.
     min_rating: minimum star rating (1-5). flag: 'pick' or 'reject'.
     camera / lens / filename: case-insensitive substrings. min_iso: minimum ISO.
@@ -276,6 +304,10 @@ def lr_list_photos(
     so on a large catalog narrow with captured_after up front.
     Each line: id | file | captured | rating | flag | exposure | camera + lens | title: ... | caption: ...
     Empty fields are left out; title and caption are cut to 60 characters (lr_get_photo has them in full)."""
+    if sort not in ("album", "captured"):
+        raise LrError("sort must be 'album' or 'captured'")
+    if limit < 1:
+        raise LrError("limit must be at least 1")
     for h in (hour_from, hour_to):
         if h is not None and not 0 <= h <= 23:
             raise LrError("hour_from and hour_to must be between 0 and 23")
@@ -283,9 +315,10 @@ def lr_list_photos(
         captured_after += "T00:00:00"
     if captured_before and len(captured_before) == 10:
         captured_before += "T23:59:59"
+    mode = _album_sort_order(album_id) if album_id else None
     out, scanned, partial = [], 0, None
     deadline = time.monotonic() + SCAN_SECONDS
-    for a in itertools.islice(_iter_assets(album_id, captured_after, captured_before), MAX_SCAN):
+    for a, order in itertools.islice(_iter_assets(album_id, captured_after, captured_before), MAX_SCAN):
         if time.monotonic() > deadline:
             partial = "time limit reached"
             break
@@ -317,16 +350,23 @@ def lr_list_photos(
             if f is None or (max_fnumber is not None and f > max_fnumber) \
                     or (min_fnumber is not None and f < min_fnumber):
                 continue
-        out.append(s)
-        if len(out) >= limit:
-            break
+        out.append((s, order))
+        if not album_id and len(out) >= limit:
+            break  # an album is sorted after the scan, so it is cut to limit only then
     else:
         # the loop ran out without a break: either the catalog ended or the scan cap did
         if scanned >= MAX_SCAN:
             partial = "scan limit reached"
     if album_id:
-        out.sort(key=lambda s: s["captured"] or "")
+        out.sort(key=lambda so: so[0]["captured"] or "", reverse=sort == "album" and mode == "captureDateDesc")
+        if sort == "album" and mode == "customAsc":
+            out.sort(key=lambda so: (so[1] is None, so[1] or ""))  # stable: ties keep capture order
+    out = [s for s, _ in out[:limit]]
     note = ", limit reached" if len(out) >= limit else ""
+    if album_id:
+        label = mode if mode in SORT_MODES else f"{mode} (unsupported, sorted by capture)"
+        by_capture = sort == "captured" and mode in SORT_MODES
+        note = f", album order: {label}" + (", sorted by capture" if by_capture else "") + note
     if partial:
         note += f", {partial} — results are partial"
         if not album_id:
@@ -379,17 +419,52 @@ def lr_view_photos(asset_ids: list[str], size: str = "640") -> list:
     return out
 
 
+SIDECAR = ".lr-mcp.json"
+
+
+def _edited(asset):
+    """Edit timestamp for the download cache. develop.userUpdated moves only when develop
+    settings (incl. crop) change, so rating/flag edits don't force a re-download; fall back to
+    the asset-wide userUpdated, then changedAtTime. None means always re-download."""
+    p = asset.get("payload", {})
+    return p.get("develop", {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
+
+
+def _read_sidecar(dest):
+    try:
+        d = json.loads((dest / SIDECAR).read_text())
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_sidecar(dest, entries):
+    """Atomic write; returns an error string instead of raising, since the photos are already saved."""
+    tmp = dest / f"{SIDECAR}.{uuid.uuid4().hex}.tmp"
+    try:
+        tmp.write_text(json.dumps(entries, indent=1, sort_keys=True))
+        os.replace(tmp, dest / SIDECAR)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        return f"could not write {SIDECAR} ({e}); the next call will download these again"
+
+
 @mcp.tool()
 def lr_download_photos(
     asset_ids: list[str] | None = None,
     album_id: str | None = None,
     size: str = "2048",
     dest_dir: str | None = None,
+    force: bool = False,
 ) -> str:
     """Save photos as JPEG files. Pass either asset_ids or album_id (the whole album).
     size: '640' | '1280' | '2048' | '2560' | 'fullsize' (original resolution with edits; slower).
     dest_dir defaults to ~/Downloads/lightroom/<album name or export-timestamp>.
-    Files are named after the original file name with a .jpg extension."""
+    Files are named after the original file name with a .jpg extension.
+    <dest_dir>/.lr-mcp.json records what was saved; on the next call into the same folder, photos
+    whose file, size and edit time are unchanged are skipped. This needs a stable folder: album_id
+    or an explicit dest_dir (asset_ids alone get a new export-<timestamp> folder each time).
+    force=True re-downloads everything, e.g. if a saved file looks stale."""
     if size not in ("640", "1280", "2048", "2560", "fullsize"):
         raise LrError("size must be one of 640, 1280, 2048, 2560, fullsize")
     if album_id:
@@ -417,24 +492,50 @@ def lr_download_photos(
         used.add(stem)
         return dest / f"{stem}.jpg"
 
-    jobs = [(a["id"], target(a)) for a in assets if a.get("subtype") == "image"]
-    errors = []
+    cache = _read_sidecar(dest)
+
+    def fresh(aid, path, updated):
+        e = cache.get(path.name)
+        if force or not updated or not e or (e.get("asset_id"), e.get("size"), e.get("updated")) != (aid, size, updated):
+            return False
+        try:
+            return path.stat().st_size == e.get("bytes")
+        except OSError:
+            return False
+
+    jobs, unchanged = [], 0
+    for a in assets:
+        if a.get("subtype") != "image":
+            continue
+        aid, path, updated = a["id"], target(a), _edited(a)  # target() for every image keeps -2/-3 stable
+        if fresh(aid, path, updated):
+            unchanged += 1
+        else:
+            jobs.append((aid, path, updated))
+    errors, saved = [], {}
 
     def fetch(job):
-        aid, path = job
+        aid, path, updated = job
         try:
-            path.write_bytes(lr.rendition(aid, size))
-        except LrError as e:
+            data = lr.rendition(aid, size)
+            path.write_bytes(data)
+            saved[path.name] = {"asset_id": aid, "size": size, "updated": updated, "bytes": len(data)}
+        except (LrError, OSError) as e:
             errors.append(f"{aid}: {e}")
 
     with ThreadPoolExecutor(6) as ex:
         list(ex.map(fetch, jobs))
-    skipped = len(assets) - len(jobs)
-    msg = f"Saved {len(jobs) - len(errors)} photos to {dest}"
+    warning = _write_sidecar(dest, {**_read_sidecar(dest), **saved}) if saved else None
+    skipped = len(assets) - len(jobs) - unchanged
+    msg = f"Saved {len(saved)} photos to {dest}"
+    if unchanged:
+        msg += f"; {unchanged} unchanged since the last download, not fetched again"
     if skipped:
         msg += f"\nSkipped {skipped} non-image assets (videos etc.)"
     if errors:
         msg += f"\n{len(errors)} failed:\n" + "\n".join(errors[:20])
+    if warning:
+        msg += f"\nWarning: {warning}"
     return msg
 
 
