@@ -7,6 +7,7 @@
                 save the credential from a JSON file downloaded from the Adobe Developer Console
 """
 import asyncio
+import itertools
 import re
 import sys
 import time
@@ -34,6 +35,8 @@ mcp = MCPServer(
 # ---------------------------------------------------------------- helpers
 
 _albums_cache = (0.0, None)
+MAX_SCAN = 20000   # assets lr_list_photos looks at before giving up
+SCAN_SECONDS = 60  # ...or the time it spends, leaving room for one slow page; clients time out at ~120 s
 
 
 def _albums():
@@ -226,6 +229,8 @@ def lr_list_photos(
     max_fnumber / min_fnumber: f-number bounds, e.g. max_fnumber=2 for f/2 or wider,
     min_fnumber=8 for f/8 or narrower. Useful when lens info is missing (manual lenses).
     Photos without the needed capture time or f-number are excluded when these are set.
+    A scan stops after 20000 assets or 60 s; the first line then says the results are partial,
+    so on a large catalog narrow with captured_after up front.
     Each line: id | file | captured | rating | flag | exposure | camera + lens"""
     for h in (hour_from, hour_to):
         if h is not None and not 0 <= h <= 23:
@@ -234,8 +239,12 @@ def lr_list_photos(
         captured_after += "T00:00:00"
     if captured_before and len(captured_before) == 10:
         captured_before += "T23:59:59"
-    out, scanned, max_scan = [], 0, 20000
-    for a in _iter_assets(album_id, captured_after, captured_before):
+    out, scanned, partial = [], 0, None
+    deadline = time.monotonic() + SCAN_SECONDS
+    for a in itertools.islice(_iter_assets(album_id, captured_after, captured_before), MAX_SCAN):
+        if time.monotonic() > deadline:
+            partial = "time limit reached"
+            break
         scanned += 1
         s = _summary(a)
         cap = (s["captured"] or "")[:19]
@@ -265,11 +274,20 @@ def lr_list_photos(
                     or (min_fnumber is not None and f < min_fnumber):
                 continue
         out.append(s)
-        if len(out) >= limit or scanned >= max_scan:
+        if len(out) >= limit:
             break
+    else:
+        # the loop ran out without a break: either the catalog ended or the scan cap did
+        if scanned >= MAX_SCAN:
+            partial = "scan limit reached"
     if album_id:
         out.sort(key=lambda s: s["captured"] or "")
-    head = f"{len(out)} photos (scanned {scanned}{', limit reached' if len(out) >= limit else ''})"
+    note = ", limit reached" if len(out) >= limit else ""
+    if partial:
+        note += f", {partial} — results are partial"
+        if not album_id:
+            note += "; narrow with captured_after"
+    head = f"{len(out)} photos (scanned {scanned}{note})"
     return head + "\n" + "\n".join(_fmt(s) for s in out)
 
 

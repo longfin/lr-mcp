@@ -185,3 +185,50 @@ def test_lr_login_reports_port_fallback(monkeypatch):
     monkeypatch.setattr(server.lr, "login", login)
     out = asyncio.run(server.lr_login())
     assert out.startswith("Signed in (refresh token: yes).") and "Port 8000 was busy" in out
+
+
+def test_list_photos_stops_at_scan_cap_without_matches(monkeypatch):
+    monkeypatch.setattr(server, "MAX_SCAN", 5)
+    pulled = []
+
+    def paginate(path):
+        for i in range(100):
+            pulled.append(i)
+            yield asset(f"a{i}", f"2024-05-01T12:{i:02d}:00")
+
+    monkeypatch.setattr(server.lr, "paginate", paginate)
+    out = server.lr_list_photos(captured_after="2024-05-01", flag="reject")
+    assert out.splitlines()[0].startswith("0 photos (scanned 5, scan limit reached")
+    assert len(pulled) == 5
+
+
+def test_list_photos_no_cap_note_when_catalog_ends(monkeypatch):
+    monkeypatch.setattr(server, "MAX_SCAN", 5)
+    items = [asset(f"a{i}", "2024-05-01T12:00:00") for i in range(3)]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(items))
+    assert server.lr_list_photos(captured_after="2024-05-01").splitlines()[0] == "3 photos (scanned 3)"
+
+
+def test_list_photos_stops_at_time_budget(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+    pulled = []
+
+    def paginate(path):
+        for i in range(100):
+            pulled.append(i)
+            clock[0] += server.SCAN_SECONDS / 4  # each asset costs a quarter of the budget
+            yield asset(f"a{i}", f"2024-05-01T12:{i:02d}:00")
+
+    monkeypatch.setattr(server.lr, "paginate", paginate)
+    out = server.lr_list_photos(captured_after="2024-05-01", flag="reject")
+    assert out.splitlines()[0] == "0 photos (scanned 4, time limit reached — results are partial; narrow with captured_after)"
+    assert len(pulled) == 5
+
+
+def test_list_photos_album_cap_note_has_no_date_hint(monkeypatch):
+    monkeypatch.setattr(server, "MAX_SCAN", 2)
+    items = [asset(f"a{i}", "2024-05-01T12:00:00") for i in range(3)]
+    monkeypatch.setattr(server.lr, "paginate", lambda path: ({"asset": a} for a in items))
+    head = server.lr_list_photos(album_id="x", flag="reject").splitlines()[0]
+    assert head == "0 photos (scanned 2, scan limit reached — results are partial)"

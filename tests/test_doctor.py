@@ -86,9 +86,9 @@ def test_login_hint_includes_custom_home(monkeypatch):
 
 
 def test_bad_port_value(monkeypatch):
-    monkeypatch.setattr(lr, "PORT_ERROR", "LR_MCP_PORT is not a number: ''")
+    monkeypatch.setattr(lr, "PORT_ERROR", "LR_MCP_PORT must be a port number 1-65535: '-1'")
     ok, msg, fix = results(monkeypatch, signed_in=False)[-1]
-    assert not ok and "not a number" in msg
+    assert not ok and "1-65535" in msg
 
 
 def test_hint_quotes_home_with_spaces(monkeypatch):
