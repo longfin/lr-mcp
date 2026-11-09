@@ -151,3 +151,10 @@ def test_integration_type_marks_only_its_own_credential():
     other = {"integration_type": "service", "oauth2": {"client_id": "other", "client_secret": "x"}}
     with pytest.raises(lr.LrError, match="2 credentials"):
         setup.find_credential(project(other, {"jwt": {"client_id": "b", "client_secret": "y"}}))
+    # the mark reaches the webapp node's own credential, not a sibling's nested one
+    web = {"integration_type": "oauthwebapp", "oauth2": {"client_id": "web", "client_secret": "s"}}
+    nested = {"deep": {"inner": {"client_id": "nested", "client_secret": "n"}}}
+    assert setup.find_credential(project(web, nested)) == ("web", "s")
+    # ...and reaches a credential inside a list under the webapp node
+    web_list = {"integration_type": "oauthwebapp", "oauth2": [{"client_id": "web2", "client_secret": "s2"}]}
+    assert setup.find_credential(project(web_list, nested)) == ("web2", "s2")

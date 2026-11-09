@@ -33,7 +33,7 @@ def find_credential(data):
                 walk(v, k, web_here)
         elif isinstance(node, list):
             for v in node:
-                walk(v, key)
+                walk(v, key, web_parent)
 
     walk(data)
     if any(web for web, _, _ in found):

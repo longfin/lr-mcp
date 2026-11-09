@@ -157,7 +157,10 @@ async def lr_login() -> str:
     other app at :8000 and sign-in times out. The reply says when this happened."""
     notices = []
     tok = await asyncio.to_thread(lr.login, 300, lambda url: None, notices.append)
-    return " ".join([f"Signed in (refresh token: {'yes' if tok.get('refresh_token') else 'no'}).", *notices])
+    msg = f"Signed in (refresh token: {'yes' if tok.get('refresh_token') else 'no'})."
+    if notices:
+        msg += f" Port {lr.PORT} was busy, so sign-in used a free port; nothing to fix since it worked."
+    return msg
 
 
 @mcp.tool()

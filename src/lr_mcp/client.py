@@ -73,10 +73,11 @@ def port_config(raw):
     """(port, set, error) for an LR_MCP_PORT value; empty or missing counts as unset.
     Never raises: `setup` and `doctor` must still run to fix a bad value."""
     raw = (raw or "").strip()
-    try:
-        return (int(raw), True, None) if raw else (8000, False, None)
-    except ValueError:
-        return 8000, True, f"LR_MCP_PORT is not a number: {raw!r}"
+    if not raw:
+        return 8000, False, None
+    if raw.isascii() and raw.isdigit() and 1 <= int(raw) <= 65535:
+        return int(raw), True, None
+    return 8000, True, f"LR_MCP_PORT must be a port number 1-65535: {raw!r}"
 
 
 _load_env()

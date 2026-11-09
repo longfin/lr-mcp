@@ -184,4 +184,4 @@ def test_lr_login_reports_port_fallback(monkeypatch):
 
     monkeypatch.setattr(server.lr, "login", login)
     out = asyncio.run(server.lr_login())
-    assert out.startswith("Signed in (refresh token: yes).") and "using port 54321" in out
+    assert out.startswith("Signed in (refresh token: yes).") and "Port 8000 was busy" in out

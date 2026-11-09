@@ -157,8 +157,9 @@ def test_port_config():
     assert lr.port_config("") == (8000, False, None)
     assert lr.port_config("  ") == (8000, False, None)
     assert lr.port_config(" 8765 ") == (8765, True, None)
-    port, port_set, err = lr.port_config("x")
-    assert port_set and "not a number" in err
+    for bad in ("x", "-1", "0", "70000", "1_000", "0x1F", "٨٠٠٠"):
+        port, port_set, err = lr.port_config(bad)
+        assert (port, port_set) == (8000, True) and "1-65535" in err, bad
 
 
 class _NoTls:
