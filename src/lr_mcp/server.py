@@ -8,6 +8,7 @@
 """
 import asyncio
 import itertools
+import math
 import re
 import sys
 import time
@@ -73,12 +74,16 @@ def _latest(d, key):
     return v.get(key)
 
 
-def _text(v):
-    """A dc string: plain, a language alternative {"x-default": ...} or {"description": ...};
-    whitespace collapsed so it stays on one line."""
-    if isinstance(v, dict):
-        v = v.get("x-default") or next((x for x in v.values() if isinstance(x, str) and x.strip()), None)
-    return (" ".join(v.split()) or None) if isinstance(v, str) else None
+def _text(v, depth=0):
+    """A dc string: plain, a language alternative {"x-default": ...}, {"description": ...} or a
+    one-element list of those; whitespace and '|' collapsed so it stays on one line."""
+    if isinstance(v, list):
+        v = v[0] if v else None
+    if isinstance(v, dict) and depth < 2:
+        xd = v.get("x-default")
+        v = xd if isinstance(xd, str) and xd.strip() else next((x for x in v.values() if _text(x, depth + 1)), None)
+        return _text(v, depth + 1)
+    return (" ".join(v.replace("|", "/").split()) or None) if isinstance(v, str) else None
 
 
 def _keywords(v):
@@ -92,7 +97,7 @@ def _keywords(v):
 
 
 def _num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def _clip(v, n=60):
@@ -101,12 +106,9 @@ def _clip(v, n=60):
 
 def _summary(asset):
     p = asset.get("payload", {})
-    exif = p.get("xmp", {}).get("exif", {})
-    tiff = p.get("xmp", {}).get("tiff", {})
-    dc = p.get("xmp", {}).get("dc", {})
-    dev = p.get("develop", {})
-    loc = p.get("location", {})
-    imp = p.get("importSource", {})
+    xmp = p.get("xmp") or {}
+    exif, tiff, dc = xmp.get("exif") or {}, xmp.get("tiff") or {}, xmp.get("dc") or {}
+    dev, loc, imp = p.get("develop") or {}, p.get("location") or {}, p.get("importSource") or {}
     cw, ch = dev.get("croppedWidth"), dev.get("croppedHeight")
     lat, lon = loc.get("latitude"), loc.get("longitude")
     shutter = exif.get("ExposureTime")

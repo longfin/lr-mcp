@@ -300,3 +300,25 @@ def test_get_photo_lists_metadata(monkeypatch):
     lines = server.lr_get_photo("a1", include_develop=False).splitlines()
     assert {"title: Busan", "keywords: sea", "cropped: 4000x3000", "orientation: 1"} <= set(lines)
     assert not any(l.startswith(("caption:", "gps:")) for l in lines)
+
+
+def test_summary_survives_null_sections_and_odd_numbers():
+    a = asset("a1", "2024-05-01T12:00:00")
+    a["payload"]["develop"] = {"croppedWidth": float("nan"), "croppedHeight": 10, "userOrientation": float("inf")}
+    a["payload"]["location"] = None
+    a["payload"]["xmp"]["dc"] = None
+    s = server._summary(a)
+    assert s["cropped"] is None and s["orientation"] is None and s["gps"] is None and s["title"] is None
+
+
+@pytest.mark.parametrize("value, expected", [
+    ({"x-default": "  ", "en": "Hi"}, "Hi"),
+    ({"description": {"x-default": "nested"}}, "nested"),
+    (["first", "second"], "first"),
+    ([{"x-default": "in list"}], "in list"),
+    ("Busan | night", "Busan / night"),
+    ([], None),
+    ({"x-default": ""}, None),
+])
+def test_text_handles_alternative_shapes(value, expected):
+    assert server._text(value) == expected
