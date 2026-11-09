@@ -355,9 +355,14 @@ def _read_sidecar(dest):
 
 
 def _write_sidecar(dest, entries):
+    """Atomic write; returns an error string instead of raising, since the photos are already saved."""
     tmp = dest / f"{SIDECAR}.{uuid.uuid4().hex}.tmp"
-    tmp.write_text(json.dumps(entries, indent=1, sort_keys=True))
-    os.replace(tmp, dest / SIDECAR)
+    try:
+        tmp.write_text(json.dumps(entries, indent=1, sort_keys=True))
+        os.replace(tmp, dest / SIDECAR)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        return f"could not write {SIDECAR} ({e}); the next call will download these again"
 
 
 @mcp.tool()
@@ -372,8 +377,10 @@ def lr_download_photos(
     size: '640' | '1280' | '2048' | '2560' | 'fullsize' (original resolution with edits; slower).
     dest_dir defaults to ~/Downloads/lightroom/<album name or export-timestamp>.
     Files are named after the original file name with a .jpg extension.
-    <dest_dir>/.lr-mcp.json records what was saved; photos whose file, size and edit time are
-    unchanged are skipped on the next call. force=True re-downloads everything."""
+    <dest_dir>/.lr-mcp.json records what was saved; on the next call into the same folder, photos
+    whose file, size and edit time are unchanged are skipped. This needs a stable folder: album_id
+    or an explicit dest_dir (asset_ids alone get a new export-<timestamp> folder each time).
+    force=True re-downloads everything, e.g. if a saved file looks stale."""
     if size not in ("640", "1280", "2048", "2560", "fullsize"):
         raise LrError("size must be one of 640, 1280, 2048, 2560, fullsize")
     if album_id:
@@ -429,21 +436,22 @@ def lr_download_photos(
             data = lr.rendition(aid, size)
             path.write_bytes(data)
             saved[path.name] = {"asset_id": aid, "size": size, "updated": updated, "bytes": len(data)}
-        except LrError as e:
+        except (LrError, OSError) as e:
             errors.append(f"{aid}: {e}")
 
     with ThreadPoolExecutor(6) as ex:
         list(ex.map(fetch, jobs))
-    if saved:
-        _write_sidecar(dest, {**_read_sidecar(dest), **saved})
+    warning = _write_sidecar(dest, {**_read_sidecar(dest), **saved}) if saved else None
     skipped = len(assets) - len(jobs) - unchanged
     msg = f"Saved {len(saved)} photos to {dest}"
     if unchanged:
-        msg += f" ({unchanged} unchanged, skipped)"
+        msg += f"; {unchanged} unchanged since the last download, not fetched again"
     if skipped:
         msg += f"\nSkipped {skipped} non-image assets (videos etc.)"
     if errors:
         msg += f"\n{len(errors)} failed:\n" + "\n".join(errors[:20])
+    if warning:
+        msg += f"\nWarning: {warning}"
     return msg
 
 

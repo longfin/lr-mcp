@@ -274,7 +274,7 @@ def test_download_skips_unchanged(lib, tmp_path):
     lib.calls.clear()
     out = _dl(tmp_path)
     assert lib.calls == []
-    assert out.splitlines()[0] == f"Saved 0 photos to {tmp_path} (2 unchanged, skipped)"
+    assert out.splitlines()[0] == f"Saved 0 photos to {tmp_path}; 2 unchanged since the last download, not fetched again"
     assert "Skipped 1 non-image" in out
 
 
@@ -284,7 +284,7 @@ def test_download_redownloads_when_edited(lib, tmp_path):
     lib.items[1]["payload"]["develop"]["userUpdated"] = "2024-07-01T00:00:00Z"
     out = _dl(tmp_path)
     assert lib.calls == ["a2"]
-    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path} (1 unchanged, skipped)"
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}; 1 unchanged since the last download, not fetched again"
     side = json.loads((tmp_path / ".lr-mcp.json").read_text())
     assert side["IMG-2.jpg"]["updated"] == "2024-07-01T00:00:00Z"
 
@@ -331,3 +331,32 @@ def test_download_keeps_other_entries_and_skips_failures(lib, tmp_path):
     _dl(tmp_path)
     assert lib.calls == ["a2"]
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_download_suffix_shift_does_not_skip_wrong_asset(tmp_path, lib):
+    server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
+    lib.calls.clear()
+    del lib.items[0]  # a1 left the selection: a2 now maps to IMG.jpg, whose entry belongs to a1
+    out = server.lr_download_photos(asset_ids=["a2"], size="2560", dest_dir=str(tmp_path))
+    assert lib.calls == ["a2"] and "unchanged" not in out
+
+
+def test_download_os_error_is_reported_and_others_recorded(tmp_path, lib, monkeypatch):
+    real = server.lr.rendition
+
+    def rendition(aid, size):
+        if aid == "a1":
+            raise OSError(28, "No space left on device")
+        return real(aid, size)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
+    assert "1 failed" in out and "a1: [Errno 28]" in out
+    assert set(server._read_sidecar(tmp_path)) == {"IMG-2.jpg"}
+
+
+def test_download_sidecar_write_failure_is_a_warning(tmp_path, lib, monkeypatch):
+    monkeypatch.setattr(server.os, "replace", lambda a, b: (_ for _ in ()).throw(OSError(13, "denied")))
+    out = server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
+    assert out.startswith("Saved 2 photos") and "Warning: could not write .lr-mcp.json" in out
+    assert not list(tmp_path.glob("*.tmp")) and not (tmp_path / server.SIDECAR).exists()
