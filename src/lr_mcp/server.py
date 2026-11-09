@@ -426,8 +426,8 @@ def _edited(asset):
     """Edit timestamp for the download cache. develop.userUpdated moves only when develop
     settings (incl. crop) change, so rating/flag edits don't force a re-download; fall back to
     the asset-wide userUpdated, then changedAtTime. None means always re-download."""
-    p = asset.get("payload", {})
-    return p.get("develop", {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
+    p = asset.get("payload") or {}
+    return (p.get("develop") or {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
 
 
 def _read_sidecar(dest):

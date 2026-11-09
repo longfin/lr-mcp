@@ -575,3 +575,8 @@ def test_download_sidecar_write_failure_is_a_warning(tmp_path, lib, monkeypatch)
     out = server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
     assert out.startswith("Saved 2 photos") and "Warning: could not write .lr-mcp.json" in out
     assert not list(tmp_path.glob("*.tmp")) and not (tmp_path / server.SIDECAR).exists()
+
+
+def test_edited_survives_null_develop():
+    assert server._edited({"id": "x", "payload": {"develop": None, "userUpdated": "2024-01-01T00:00:00Z"}}) == "2024-01-01T00:00:00Z"
+    assert server._edited({"id": "x", "payload": None}) is None
