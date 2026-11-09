@@ -73,11 +73,42 @@ def _latest(d, key):
     return v.get(key)
 
 
+def _text(v):
+    """A dc string: plain, a language alternative {"x-default": ...} or {"description": ...};
+    whitespace collapsed so it stays on one line."""
+    if isinstance(v, dict):
+        v = v.get("x-default") or next((x for x in v.values() if isinstance(x, str) and x.strip()), None)
+    return (" ".join(v.split()) or None) if isinstance(v, str) else None
+
+
+def _keywords(v):
+    """dc.subject as a list of strings or a {keyword: true} map."""
+    if isinstance(v, dict):
+        v = [k for k, on in v.items() if on]
+    if isinstance(v, str):
+        v = [v]
+    kw = [t for t in (_text(x) for x in v or []) if t] if isinstance(v, list) else []
+    return ", ".join(kw) or None
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _clip(v, n=60):
+    return v if len(v) <= n else v[:n - 1] + "…"
+
+
 def _summary(asset):
     p = asset.get("payload", {})
     exif = p.get("xmp", {}).get("exif", {})
     tiff = p.get("xmp", {}).get("tiff", {})
+    dc = p.get("xmp", {}).get("dc", {})
+    dev = p.get("develop", {})
+    loc = p.get("location", {})
     imp = p.get("importSource", {})
+    cw, ch = dev.get("croppedWidth"), dev.get("croppedHeight")
+    lat, lon = loc.get("latitude"), loc.get("longitude")
     shutter = exif.get("ExposureTime")
     if isinstance(shutter, list) and len(shutter) == 2 and shutter[1]:
         shutter = f"{shutter[0]}/{shutter[1]}" if shutter[0] < shutter[1] else f"{shutter[0] / shutter[1]:g}"
@@ -97,6 +128,12 @@ def _summary(asset):
         "shutter": shutter,
         "focal_mm": round(focal) if isinstance(focal, (int, float)) else None,
         "size": f"{imp.get('originalWidth')}x{imp.get('originalHeight')}" if imp.get("originalWidth") else None,
+        "cropped": f"{round(cw)}x{round(ch)}" if _num(cw) and _num(ch) else None,
+        "orientation": dev.get("userOrientation") if _num(dev.get("userOrientation")) else None,
+        "gps": f"{lat},{lon}" if _num(lat) and _num(lon) else None,
+        "title": _text(dc.get("title")),
+        "caption": _text(dc.get("description")),
+        "keywords": _keywords(dc.get("subject")),
     }
 
 
@@ -112,6 +149,9 @@ def _fmt(s):
         bits.append(exp)
     if s["camera"]:
         bits.append(s["camera"] + (f" + {s['lens']}" if s["lens"] else ""))
+    for k in ("title", "caption"):
+        if s.get(k):
+            bits.append(f"{k}: {_clip(s[k])}")
     return " | ".join(bits)
 
 
@@ -231,7 +271,8 @@ def lr_list_photos(
     Photos without the needed capture time or f-number are excluded when these are set.
     A scan stops after 20000 assets or 60 s; the first line then says the results are partial,
     so on a large catalog narrow with captured_after up front.
-    Each line: id | file | captured | rating | flag | exposure | camera + lens"""
+    Each line: id | file | captured | rating | flag | exposure | camera + lens | title: ... | caption: ...
+    Empty fields are left out; title and caption are cut to 60 characters (lr_get_photo has them in full)."""
     for h in (hour_from, hour_to):
         if h is not None and not 0 <= h <= 23:
             raise LrError("hour_from and hour_to must be between 0 and 23")
@@ -293,7 +334,9 @@ def lr_list_photos(
 
 @mcp.tool()
 def lr_get_photo(asset_id: str, include_develop: bool = True) -> str:
-    """Details for one photo: capture info, rating/flag, original file, and a summary of its edits."""
+    """Details for one photo: capture info, rating/flag, title, caption, keywords, original file,
+    original and cropped pixel size, orientation (EXIF value; 6 and 8 are 90-degree rotations; the
+    sizes are as stored and are not swapped for it), GPS when present, and a summary of its edits."""
     a = lr.get_json(lr.catalog_path() + f"assets/{asset_id}")
     s = _summary(a)
     lines = [f"{k}: {v}" for k, v in s.items() if v is not None]

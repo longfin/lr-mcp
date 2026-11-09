@@ -232,3 +232,71 @@ def test_list_photos_album_cap_note_has_no_date_hint(monkeypatch):
     monkeypatch.setattr(server.lr, "paginate", lambda path: ({"asset": a} for a in items))
     head = server.lr_list_photos(album_id="x", flag="reject").splitlines()[0]
     assert head == "0 photos (scanned 2, scan limit reached — results are partial)"
+
+
+def test_summary_metadata_missing():
+    a = asset("a1", "2024-05-01T10:00:00")
+    s = server._summary(a)
+    for k in ("title", "caption", "keywords", "cropped", "orientation", "gps"):
+        assert s[k] is None
+    assert server._fmt(s) == "a1 | IMG.ARW | 2024-05-01T10:00:00 | f/2.8 1/250s ISO100 35mm | SONY ILCE-7M4 + FE 35mm F1.4 GM"
+    a["payload"]["xmp"]["dc"] = {"title": "  ", "description": {}, "subject": []}
+    a["payload"]["location"] = {"direction": 120.5}
+    assert all(server._summary(a)[k] is None for k in ("title", "caption", "keywords", "gps"))
+
+
+@pytest.mark.parametrize("caption", [
+    "Harbour at dusk",
+    {"description": "Harbour at dusk"},
+    {"x-default": "Harbour at dusk"},
+    "Harbour\n  at\tdusk ",
+])
+def test_summary_caption_forms(caption):
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["xmp"]["dc"] = {"title": "Busan", "description": caption}
+    s = server._summary(a)
+    assert s["title"] == "Busan"
+    assert s["caption"] == "Harbour at dusk"
+
+
+@pytest.mark.parametrize("subject, expected", [
+    (["sea", "night"], "sea, night"),
+    ({"sea": True, "night": True, "old": False}, "sea, night"),
+    ("sea", "sea"),
+])
+def test_summary_keywords(subject, expected):
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["xmp"]["dc"] = {"subject": subject}
+    assert server._summary(a)["keywords"] == expected
+
+
+def test_summary_crop_orientation_gps():
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["develop"] = {"croppedWidth": 5400, "croppedHeight": 3037.6, "userOrientation": 8}
+    a["payload"]["location"] = {"latitude": 35.1, "longitude": 129.04, "direction": 90}
+    s = server._summary(a)
+    assert (s["cropped"], s["orientation"], s["gps"], s["size"]) == ("5400x3038", 8, "35.1,129.04", "6000x4000")
+
+
+def test_fmt_appends_title_and_caption():
+    a = asset("a1", "2024-05-01T10:00:00", rating=3)
+    a["payload"]["xmp"]["dc"] = {"title": "Busan\nnight", "description": {"x-default": "word " * 30}}
+    s = server._summary(a)
+    line = server._fmt(s)
+    assert "\n" not in line
+    assert line.startswith("a1 | IMG.ARW | 2024-05-01T10:00:00 | ★★★ | f/2.8 1/250s ISO100 35mm"
+                           " | SONY ILCE-7M4 + FE 35mm F1.4 GM | title: Busan night | caption: word word")
+    caption = line.split(" | caption: ")[1]
+    assert len(caption) == 60 and caption.endswith("…")
+    s["title"] = None
+    assert " | title: " not in server._fmt(s) and " | caption: " in server._fmt(s)
+
+
+def test_get_photo_lists_metadata(monkeypatch):
+    a = asset("a1", "2024-05-01T10:00:00")
+    a["payload"]["xmp"]["dc"] = {"title": "Busan", "subject": ["sea"]}
+    a["payload"]["develop"] = {"croppedWidth": 4000, "croppedHeight": 3000, "userOrientation": 1}
+    monkeypatch.setattr(server.lr, "get_json", lambda path: a)
+    lines = server.lr_get_photo("a1", include_develop=False).splitlines()
+    assert {"title: Busan", "keywords: sea", "cropped: 4000x3000", "orientation: 1"} <= set(lines)
+    assert not any(l.startswith(("caption:", "gps:")) for l in lines)
