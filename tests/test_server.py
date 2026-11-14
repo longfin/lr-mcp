@@ -910,8 +910,8 @@ def test_download_stops_after_photos_fail_in_a_row(tmp_path, monkeypatch, sleeps
     # p0 is retried; p1 too (one failure in a row so far); then the call stops
     assert calls == ["p0", "p0", "p1", "p1"] and sleeps == [1, 1]
     assert "\n2 failed:\n" in out
-    assert out.endswith("4 more not tried: 2 photos failed in a row, so the download stopped early; "
-                        "call again to fetch them")
+    assert out.endswith("4 more not tried: 2 photos in a row failed with network or server errors, so the "
+                        "download stopped early; call again to continue with them")
 
 
 def test_a_success_resets_the_failure_streak(tmp_path, monkeypatch, sleeps):
@@ -927,6 +927,131 @@ def test_a_success_resets_the_failure_streak(tmp_path, monkeypatch, sleeps):
     monkeypatch.setattr(server.lr, "rendition", rendition)
     out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
     assert out.splitlines()[0] == f"Saved 3 photos to {tmp_path}" and "3 failed" in out and "not tried" not in out
+
+
+def _http(status):
+    return server.lr._http_error(f"Rendition 2048 failed ({status}): x", status)
+
+
+def test_permanent_failures_do_not_stop_the_download(tmp_path, monkeypatch, sleeps):
+    ids = _photos(monkeypatch, 30)
+    _one_worker(monkeypatch)  # job order: p0..p29
+    bad = set(ids[:10])
+
+    def rendition(aid, size):
+        if aid in bad:
+            raise _http(404 if aid != "p5" else 403)
+        return aid.encode()
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert out.splitlines()[0] == f"Saved 20 photos to {tmp_path}"
+    assert "10 failed" in out and "not tried" not in out
+
+
+def test_write_errors_do_not_stop_the_download(tmp_path, monkeypatch):
+    ids = _photos(monkeypatch, 12)
+    _one_worker(monkeypatch)
+    monkeypatch.setattr(server.lr, "rendition", lambda aid, size: aid.encode())
+    real = server._write_atomic
+
+    def write(path, data):
+        if path.suffix == ".jpg" and int(path.stem.split("_")[1]) < 9:
+            raise OSError(28, "No space left on device")
+        real(path, data)
+
+    monkeypatch.setattr(server, "_write_atomic", write)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert out.splitlines()[0] == f"Saved 3 photos to {tmp_path}" and "9 failed" in out and "not tried" not in out
+
+
+@pytest.mark.parametrize("error", [_http(503), _http(429), _http(500),
+                                   LrError("GET … failed after 6 attempts: ConnectionResetError()"),
+                                   _retryable(True)])
+def test_outage_like_failures_trip_the_breaker(tmp_path, monkeypatch, sleeps, error):
+    ids = _photos(monkeypatch, 12)
+    _one_worker(monkeypatch)
+
+    def rendition(aid, size):
+        raise error
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert f"\n{server.GIVE_UP_AFTER} failed:\n" in out
+    assert out.endswith(f"{12 - server.GIVE_UP_AFTER} more not tried: {server.GIVE_UP_AFTER} photos in a row failed "
+                        "with network or server errors, so the download stopped early; call again to continue with them")
+
+
+def test_breaker_streak_with_a_mix_of_failures(tmp_path, monkeypatch, sleeps):
+    ids = _photos(monkeypatch, 10)
+    _one_worker(monkeypatch)
+    monkeypatch.setattr(server, "GIVE_UP_AFTER", 3)
+    # outage, outage, 404 (neither counts nor resets), ok (resets), outage, outage, 404, outage -> trips
+    plan = {"p0": _http(503), "p1": _http(503), "p2": _http(404), "p4": _http(502), "p5": _http(500),
+            "p6": _http(404), "p7": _http(503)}
+
+    def rendition(aid, size):
+        if aid in plan:
+            raise plan[aid]
+        return aid.encode()
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}"  # p3 only
+    assert "7 failed" in out and "2 more not tried: 3 photos in a row" in out
+
+
+def test_outage_rule():
+    assert server._outage(_http(500)) and server._outage(_http(429)) and server._outage(LrError("network"))
+    assert server._outage(_retryable(True))
+    assert not server._outage(_http(404)) and not server._outage(_http(403)) and not server._outage(_http(400))
+    assert not server._outage(OSError(28, "No space left on device"))
+
+
+def test_retry_respects_the_breaker(monkeypatch, sleeps):
+    calls = []
+
+    def rendition(aid, size):
+        calls.append(aid)
+        raise _retryable(True)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    with pytest.raises(LrError):
+        server._rendition("a1", "fullsize", may_retry=lambda: False)
+    assert calls == ["a1"] and sleeps == []
+    with pytest.raises(LrError):
+        server._rendition("a1", "fullsize", may_retry=lambda: True)
+    assert calls == ["a1"] * (1 + server.DOWNLOAD_ATTEMPTS) and sleeps == [1]
+
+
+def test_breaker_stops_retries_already_under_way(tmp_path, monkeypatch, sleeps):
+    """p1's first attempt fails after p0 has tripped the breaker: p1 is not tried again."""
+    ids = _photos(monkeypatch, 2)
+    monkeypatch.setattr(server, "GIVE_UP_AFTER", 1)
+    monkeypatch.setattr(server, "ThreadPoolExecutor", lambda n: ThreadPoolExecutor(2))
+    may_retry, calls, p1_started = {}, [], threading.Event()
+    real = server._rendition
+
+    def _rendition(aid, size, retry=lambda: True):
+        may_retry[aid] = retry
+        return real(aid, size, retry)
+
+    def rendition(aid, size):
+        calls.append(aid)
+        if aid == "p0":
+            assert p1_started.wait(10)  # both photos are under way
+            raise _http(503)
+        p1_started.set()
+        stop = time.monotonic() + 10
+        while may_retry["p1"]() and time.monotonic() < stop:  # until p0's failure is counted
+            threading.Event().wait(0.001)
+        raise _retryable(True)
+
+    monkeypatch.setattr(server, "_rendition", _rendition)
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert sorted(calls) == ["p0", "p1"] and sleeps == []  # without the breaker check p1 would be retried
+    assert "2 failed" in out
 
 
 def test_download_naming_by_id(lib, tmp_path):

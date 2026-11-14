@@ -432,7 +432,7 @@ def lr_view_photos(asset_ids: list[str], size: str = "640") -> list:
 SIDECAR = ".lr-mcp.json"
 SIDECAR_LOCK = SIDECAR + ".lock"  # held while the sidecar is merged; kept in the folder
 DOWNLOAD_ATTEMPTS = 2  # tries per photo for failures the client has not retried already (see lr.rendition)
-GIVE_UP_AFTER = 8      # photos failing in a row that end a download early, e.g. during an outage
+GIVE_UP_AFTER = 8      # photos failing in a row with outage-like errors (see _outage) that end a download early
 STALE_TEMP_SECONDS = 3600  # a temp file of ours this old was left by a killed run
 _TEMP = re.compile(r"\..+\.[0-9a-f]{32}\.tmp")  # _write_atomic's temp file names
 # flock errors meaning the file system has no locks (some NFS, SMB and FUSE mounts)
@@ -559,6 +559,13 @@ class _Sidecar:
         return error
 
 
+def _outage(e):
+    """A failure that says more about the service than about this photo: a network failure (an
+    LrError without an HTTP status), a 429 or 5xx status, or one the client marks retryable.
+    A 4xx such as 404 or 403 and an OSError from writing a file are about the photo or the disk."""
+    return isinstance(e, LrError) and (e.retryable or e.status is None or e.status == 429 or e.status >= 500)
+
+
 def _rendition(asset_id, size, may_retry=lambda: True):
     """lr.rendition, tried up to DOWNLOAD_ATTEMPTS times with backoff when the failure is retryable
     (see lr.rendition: only what the client has not retried itself) and may_retry() allows it."""
@@ -594,8 +601,9 @@ def lr_download_photos(
     force=True re-downloads everything, e.g. if a saved file looks stale.
     Each file is written under a temporary name and renamed when complete, so the folder must be
     writable (in a read-only one every photo fails). A rendition still being generated after a
-    minute, or a failed generation request, gets one more try. After 8 photos fail in a row the
-    rest are not tried, and the reply says how many; call again to continue."""
+    minute, or a failed generation request, gets one more try. After 8 photos in a row fail with
+    network or server errors (not e.g. a 404 for one photo) the rest are not tried, and the reply
+    says how many; call again to continue."""
     if size not in ("640", "1280", "2048", "2560", "fullsize"):
         raise LrError("size must be one of 640, 1280, 2048, 2560, fullsize")
     if naming not in ("file", "id"):
@@ -649,7 +657,7 @@ def lr_download_photos(
         else:
             jobs.append((aid, path, updated))
     errors, saved, sidecar, not_tried = [], {}, _Sidecar(dest), []
-    streak, streak_lock = [0], threading.Lock()  # photos failed in a row
+    streak, streak_lock = [0], threading.Lock()  # photos failed in a row with outage-like errors
 
     def fetch(job):
         aid, path, updated = job
@@ -661,8 +669,9 @@ def lr_download_photos(
             data = _rendition(aid, size, lambda: streak[0] < GIVE_UP_AFTER)
             _write_atomic(path, data)
         except (LrError, OSError) as e:
-            with streak_lock:
-                streak[0] += 1
+            if _outage(e):  # other failures neither count nor reset the streak
+                with streak_lock:
+                    streak[0] += 1
             errors.append(f"{aid}: {e}")
             return
         with streak_lock:
@@ -684,8 +693,8 @@ def lr_download_photos(
     if errors:
         msg += f"\n{len(errors)} failed:\n" + "\n".join(errors[:20])
     if not_tried:
-        msg += (f"\n{len(not_tried)} more not tried: {GIVE_UP_AFTER} photos failed in a row, so the download "
-                "stopped early; call again to fetch them")
+        msg += (f"\n{len(not_tried)} more not tried: {GIVE_UP_AFTER} photos in a row failed with network or server "
+                "errors, so the download stopped early; call again to continue with them")
     if warning:
         msg += f"\nWarning: {warning}"
     return msg
