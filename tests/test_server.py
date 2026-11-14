@@ -729,3 +729,17 @@ def test_a_failed_add_still_forgets_the_album_count(monkeypatch):
     with pytest.raises(LrError, match="500"):
         server.lr_add_to_project_album("p", [f"id{i}" for i in range(60)])
     assert "p" not in server.lr._count_cache
+
+
+def test_list_albums_reports_a_request_cut_off_by_the_time_limit_as_not_counted(monkeypatch):
+    def count(album_id, updated=None, deadline=None):
+        if album_id == "b":
+            monkeypatch.setattr(server.time, "monotonic", lambda: deadline + 1)
+            raise LrError("GET albums/b/assets failed after 1 attempt: TimeoutError()")
+        return 5
+
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter([a for a in ALBUMS if a["id"] in "fb"]))
+    monkeypatch.setattr(server.lr, "album_asset_count", count)
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("2 albums (1 not counted, time limit reached") and "could not" not in out[0]
+    assert out[1] == "Travel / Osaka  (b)  ? photos"

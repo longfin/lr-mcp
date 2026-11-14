@@ -259,9 +259,10 @@ def _album_counts(albums):
         try:
             return lr.album_asset_count(a["id"], a.get("updated"), deadline)
         except Exception as e:  # one bad album or response must not lose the whole listing
-            return e
+            # a request cut short by the deadline fails too; that album is late, not broken
+            return None if time.monotonic() > deadline else e
 
-    # every worker is back soon after the deadline: requests stop retrying and waiting at it
+    # workers come back soon after the deadline: requests stop retrying and waiting for data at it
     with ThreadPoolExecutor(6) as ex:
         results = list(ex.map(count, albums))
     counts = {a["id"]: r for a, r in zip(albums, results) if isinstance(r, int)}

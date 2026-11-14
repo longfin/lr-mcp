@@ -23,6 +23,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -311,7 +312,8 @@ def _too_late(deadline, delay):
 def request(method, path, body=None, content_type="application/json", auth=True, headers=None, deadline=None):
     """`path` is '/v2/...' or an absolute URL. Returns (status, bytes).
     deadline: a time.monotonic() value that bounds a GET's retries: no retry is started that would
-    begin after it, and an attempt waits no longer for data than the time left (at least 1 s)."""
+    begin after it, and an attempt waits no longer for each read than the time left (at least 1 s).
+    A response that keeps arriving slowly is still read to the end."""
     headers = {"X-API-Key": client_id(), **(headers or {})}
     if auth:
         headers["Authorization"] = f"Bearer {access_token()}"
@@ -394,6 +396,7 @@ def paginate(path):
 COUNT_TTL = 600     # seconds a count is trusted; see album_asset_count
 _count_cache = {}   # album_id -> (album `updated`, time.monotonic() when counted, count)
 _count_gen = {}     # album_id -> times forget_album_count was called, so a count under way is not kept
+_count_lock = threading.Lock()  # counts run in parallel, and forget_album_count may come from another tool call
 
 
 def album_asset_count(album_id, updated=None, deadline=None):
@@ -407,7 +410,7 @@ def album_asset_count(album_id, updated=None, deadline=None):
     does not always move when photos are added to an album.
     deadline: a time.monotonic() value. Returns None, caching nothing, when the count is not
     cached and the deadline passes before the first request or while pages are still left.
-    Requests stop retrying at the deadline, so the call returns or raises soon after it.
+    Requests stop retrying at the deadline, so the call normally returns or raises soon after it.
     """
     hit = _count_cache.get(album_id)
     if hit and hit[0] == updated and time.monotonic() - hit[1] < COUNT_TTL:
@@ -421,16 +424,18 @@ def album_asset_count(album_id, updated=None, deadline=None):
         more = data.get("links", {}).get("next", {}).get("href")
         if more and deadline is not None and time.monotonic() > deadline:
             return None
-    if _count_gen.get(album_id, 0) == gen:  # else the album changed while it was being counted
-        _count_cache[album_id] = (updated, time.monotonic(), n)
+    with _count_lock:
+        if _count_gen.get(album_id, 0) == gen:  # else the album changed while it was being counted
+            _count_cache[album_id] = (updated, time.monotonic(), n)
     return n
 
 
 def forget_album_count(album_id):
     """Drop the cached count of an album whose contents were just changed, and keep a count
     of it that is under way in another thread from being cached."""
-    _count_gen[album_id] = _count_gen.get(album_id, 0) + 1
-    _count_cache.pop(album_id, None)
+    with _count_lock:
+        _count_gen[album_id] = _count_gen.get(album_id, 0) + 1
+        _count_cache.pop(album_id, None)
 
 
 def rendition(asset_id, kind):
