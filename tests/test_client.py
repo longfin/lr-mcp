@@ -574,3 +574,14 @@ def test_get_without_deadline_is_unchanged_by_a_far_deadline(monkeypatch):
     with pytest.raises(lr.LrError, match="failed after 6 attempts"):
         lr.request("GET", "/v2/account", deadline=100 + 3600)
     assert slept == [1, 3, 5, 7, 9] and timeouts == [lr.REQUEST_TIMEOUT] * 6
+
+
+def test_token_request_error_carries_the_status(monkeypatch):
+    import email.message
+    def urlopen(req, timeout=None):
+        raise lr.urllib.error.HTTPError("https://x", 400, "bad", email.message.Message(), io.BytesIO(b'{"error": "invalid_grant"}'))
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    with pytest.raises(lr.LrError, match="Token request failed") as e:
+        lr._token_request({"grant_type": "refresh_token", "refresh_token": "rt"})
+    assert e.value.status == 400

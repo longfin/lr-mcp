@@ -66,7 +66,15 @@ def _album_paths():
 _album_cache = catalog._album_cache  # the same dict: one cache for the tools and catalog.album_info
 ALBUM_TTL = catalog.ALBUM_TTL
 SORT_MODES = catalog.SORT_MODES
-_text = catalog._text
+
+
+def _oneline(v):
+    """Text for a one-line listing: whitespace collapsed, '|' (the field separator) replaced by '/'."""
+    return (" ".join(v.replace("|", "/").split()) or None) if v else None
+
+
+def _text(v):
+    return _oneline(catalog._text(v))
 
 
 def _album_sort_order(album_id):
@@ -101,9 +109,9 @@ def _summary(asset):
         "cropped": f"{round(cropped[0])}x{round(cropped[1])}" if cropped else None,
         "orientation": d["orientation"],
         "gps": f"{gps[0]},{gps[1]}" if gps else None,
-        "title": d["title"],
-        "caption": d["caption"],
-        "keywords": ", ".join(d["keywords"]) or None,
+        "title": _oneline(d["title"]),
+        "caption": _oneline(d["caption"]),
+        "keywords": ", ".join(_oneline(k) for k in d["keywords"]) or None,
     }
 
 
@@ -539,7 +547,7 @@ def lr_create_project_album(name: str, asset_ids: list[str] | None = None) -> st
                     "publishInfo": {"version": 3, "created": now, "updated": now}},
     })
     if status != 201:
-        raise LrError(f"Creating the album failed ({status}): {lr.parse(body)}")
+        raise lr._http_error(f"Creating the album failed ({status}): {lr.parse(body)}", status)
     global _albums_cache
     _albums_cache = (0.0, None)
     msg = f"Created album {name} ({album_id})"
@@ -559,7 +567,7 @@ def lr_add_to_project_album(album_id: str, asset_ids: list[str]) -> str:
                                       {"resources": [{"id": a, "payload": {}} for a in chunk]})
             data = lr.parse(body) or {}
             if status not in (201, 403):
-                raise LrError(f"Adding photos failed ({status}): {data}")
+                raise lr._http_error(f"Adding photos failed ({status}): {data}", status)
             # added photos come back in `resources`, failed ones per photo in top-level `errors`
             added += len(data.get("resources", []))
             for e in data.get("errors", []):
@@ -577,7 +585,7 @@ def lr_delete_project_album(album_id: str) -> str:
     """Delete a project album created by this server. Only the album is removed; photos stay in the catalog."""
     status, body = lr.request("DELETE", lr.catalog_path() + f"albums/{album_id}")
     if status != 204:
-        raise LrError(f"Deleting the album failed ({status}): {lr.parse(body)}")
+        raise lr._http_error(f"Deleting the album failed ({status}): {lr.parse(body)}", status)
     global _albums_cache
     _albums_cache = (0.0, None)
     lr.forget_album_count(album_id)

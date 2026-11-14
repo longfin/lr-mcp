@@ -163,7 +163,7 @@ def test_asset_summary_is_data():
         "rating": 4, "flag": "pick", "camera": "SONY ILCE-7M4", "lens": "FE 35mm F1.4 GM", "iso": 200,
         "fnumber": 2.8, "shutter": "1/250", "exposure_time": 0.004, "focal_length": 35.0,
         "original": (6000, 4000), "cropped": (5400, 3037.6), "orientation": 8, "gps": (35.1, 129.04),
-        "title": "Busan", "caption": "Harbour at dusk", "keywords": ["sea", "night"],
+        "title": "Busan", "caption": "Harbour\nat dusk", "keywords": ["sea", "night"],
         "edited": "2024-06-01T00:00:00Z",
     }
 
@@ -238,6 +238,7 @@ def _exif(**exif):
 @pytest.mark.parametrize("value, shutter, seconds", [
     (0.5, "0.5", 0.5),
     (2, "2", 2.0),
+    (30.0, "30.0", 30.0),
     ([1, 250], "1/250", 0.004),
     ("1/60", "1/60", None),        # text is kept as text, but it is no number
     ([1, 0], None, None),
@@ -279,7 +280,7 @@ def test_asset_summary_original_needs_two_numbers(width, height):
 def test_asset_summary_types_on_malformed_asset():
     a = {"id": "a", "subtype": 1, "payload": {
         "captureDate": 20240501, "importSource": {"fileName": ["x.jpg"]},
-        "xmp": {"exif": {"ISOSpeedRatings": "100"}, "tiff": {"Make": 1, "Model": "M"}, "aux": {"Lens": {"x": 1}},
+        "xmp": {"exif": {"ISOSpeedRatings": "high"}, "tiff": {"Make": 1, "Model": "M"}, "aux": {"Lens": {"x": 1}},
                 "dc": {"title": 5, "subject": [1, "sea"]}},
         "ratings": {"u": {"rating": True, "date": None}, "v": "junk"},
         "reviews": {"u": {"flag": 1, "date": "2024"}},
@@ -300,7 +301,8 @@ def test_asset_summary_sections_of_the_wrong_type():
     assert catalog.asset_summary({"id": "b", "payload": "x"})["captured"] is None
 
 
-@pytest.mark.parametrize("iso, expected", [(400, 400), ([800], 800), ([], None), ("100", None), (True, None)])
+@pytest.mark.parametrize("iso, expected", [(400, 400), ([800], 800), ([], None), ("200", 200), (["200"], 200), ("ISO 100", None), ("²", None),
+                                         (True, None)])
 def test_asset_summary_iso(iso, expected):
     assert catalog.asset_summary(_exif(ISOSpeedRatings=iso))["iso"] == expected
 
@@ -323,3 +325,100 @@ def test_album_order_tolerates_odd_capture_dates(album, monkeypatch):
     monkeypatch.setattr(catalog.lr, "paginate", lambda path: iter(entries))
     album.payload = {"assetSortOrder": "captureDateAsc"}
     assert _ids(catalog.album_assets("x")) == ["num", "str"]
+
+
+@pytest.mark.parametrize("exposure, line", [  # main printed str(value) + "s" for a numeric ExposureTime
+    (30.0, "30.0s"),
+    (0.0001234567, "0.0001234567s"),
+    (1 / 3, "0.3333333333333333s"),
+    (0.5, "0.5s"),
+    (2, "2s"),
+])
+def test_numeric_exposure_time_tool_line_as_on_main(exposure, line):
+    a = _exif(ExposureTime=exposure)
+    assert server._fmt(server._summary(a)) == f"a | ? | 2024-05-01T00:00:00 | {line}"
+
+
+@pytest.mark.parametrize("resource", [{}, {"id": 5}, {"id": None, "payload": {}}, None, "a1"])
+def test_asset_summary_needs_a_string_id(resource):
+    with pytest.raises(LrError, match="no string id"):
+        catalog.asset_summary(resource)
+
+
+@pytest.mark.parametrize("rating, expected", [(0, 0), (5, 5), (6, None), (-1, None), (4.0, None), (True, None)])
+def test_asset_summary_rating_range(rating, expected):
+    a = _asset("a", "2024-05-01T00:00:00", ratings={"u": {"rating": rating, "date": "2024"}})
+    assert catalog.asset_summary(a)["rating"] == expected
+
+
+@pytest.mark.parametrize("w, h", [(0, 4000), (6000, 0), (-6000, 4000), (6000, -1.5), (0.0, 0.0)])
+def test_sizes_must_be_positive(w, h):
+    a = _asset("a", "2024-05-01T00:00:00", importSource={"originalWidth": w, "originalHeight": h},
+               develop={"croppedWidth": w, "croppedHeight": h})
+    s = catalog.asset_summary(a)
+    assert s["original"] is None and s["cropped"] is None
+    assert server._summary(a)["size"] is None and server._summary(a)["cropped"] is None
+
+
+CAPTION = "  첫 줄입니다\n둘째 줄 | 끝\t "
+
+
+@pytest.mark.parametrize("value", [CAPTION, {"x-default": CAPTION, "ko": "다른 말"}, [CAPTION],
+                                   {"x-default": " ", "ko": CAPTION}])
+def test_title_and_caption_are_the_real_text(value):
+    a = _asset("a", "2024-05-01T00:00:00", xmp={"dc": {"title": value, "description": value,
+                                                       "subject": [" 바다 | 밤 ", "line\nbreak"]}})
+    s = catalog.asset_summary(a)
+    assert s["title"] == s["caption"] == "첫 줄입니다\n둘째 줄 | 끝"
+    assert s["keywords"] == ["바다 | 밤", "line\nbreak"]
+    t = server._summary(a)  # the tools still print one line
+    assert t["title"] == t["caption"] == "첫 줄입니다 둘째 줄 / 끝"
+    assert t["keywords"] == "바다 / 밤, line break"
+    assert server._fmt(t).endswith(" | title: 첫 줄입니다 둘째 줄 / 끝 | caption: 첫 줄입니다 둘째 줄 / 끝")
+
+
+def test_whitespace_only_text_is_none():
+    a = _asset("a", "2024-05-01T00:00:00", xmp={"dc": {"title": " \n\t", "description": {"x-default": ""}}})
+    s = catalog.asset_summary(a)
+    assert s["title"] is None and s["caption"] is None
+
+
+def test_album_deleted_after_album_info_was_cached(album, monkeypatch):
+    catalog.album_info("x")  # cached for a minute
+
+    def paginate(path):
+        raise server.lr._http_error(f"GET {path} returned 404: {{'code': 1002}}", 404)
+        yield
+
+    monkeypatch.setattr(catalog.lr, "paginate", paginate)
+    with pytest.raises(LrError) as e:
+        catalog.album_assets("x")
+    assert str(e.value).startswith("Album not found: x") and e.value.status == 404
+    assert "x" not in catalog._album_cache  # not trusted any more
+
+
+def test_other_errors_while_listing_an_album_pass_through(album, monkeypatch):
+    def paginate(path):
+        raise server.lr._http_error("GET … returned 500: oops", 500)
+        yield
+
+    monkeypatch.setattr(catalog.lr, "paginate", paginate)
+    with pytest.raises(LrError, match="returned 500") as e:
+        catalog.album_assets("x")
+    assert e.value.status == 500
+
+
+def test_http_errors_carry_their_status(monkeypatch):
+    monkeypatch.setattr(server.lr, "catalog_path", lambda: "/v2/catalogs/c/")
+    monkeypatch.setattr(server.lr, "request", lambda *a, **k: (500, b'{"code": 1}'))
+    for call in (lambda: server.lr.rendition("a1", "2048"), lambda: server.lr_create_project_album("n"),
+                 lambda: server.lr_add_to_project_album("p", ["a"]), lambda: server.lr_delete_project_album("p"),
+                 lambda: server.lr.get_json("/v2/account")):
+        with pytest.raises(LrError) as e:
+            call()
+        assert e.value.status == 500
+    monkeypatch.setattr(server.lr, "request", lambda *a, **k: (404, b""))
+    with pytest.raises(LrError) as e:
+        server.lr.rendition("a1", "fullsize")  # 404 makes it generate; the POST gets 404 too
+    assert e.value.status == 404
+    assert LrError("plain").status is None
