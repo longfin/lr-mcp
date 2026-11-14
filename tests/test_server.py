@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +34,7 @@ def catalog(monkeypatch):
     server._albums_cache = (0.0, None)
     server._album_cache.clear()
     server.lr._count_cache.clear()
+    monkeypatch.setattr(server.lr, "access_token", lambda: "token")
     monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {}})
 
 
@@ -597,6 +600,8 @@ def count_albums(monkeypatch, sizes):
 
     def count(album_id, updated=None, deadline=None):
         calls.append((album_id, updated))
+        if deadline is not None and time.monotonic() > deadline:
+            return None
         n = sizes[album_id]
         if isinstance(n, Exception):
             raise n
@@ -639,7 +644,7 @@ def test_list_albums_counts_stop_at_time_limit(monkeypatch):
     assert out[0].startswith("4 albums (3 not counted, time limit reached")
     assert out[1:] == ["Travel / Kyoto  (a)  ? photos", "Travel / Osaka  (b)  ? photos", "[folder] Travel  (f)",
                        "[project] Picks  (p)  ? photos"]
-    assert calls == []  # nothing is started once the time is up
+    assert sorted(calls) == [("a", "u1"), ("b", "u2"), ("p", "u3")]  # each is asked, for its cached count
 
 
 def test_list_albums_counts_album_cut_off_midway(monkeypatch):
@@ -664,3 +669,85 @@ def test_changing_a_project_album_forgets_its_count(monkeypatch):
     server.lr_add_to_project_album("p", ["x"])
     server.lr_delete_project_album("q")
     assert list(server.lr._count_cache) == ["a"]
+
+
+def serve_album_assets(monkeypatch, sizes):
+    """Serve ALBUMS and one page of album assets per album through the real album_asset_count."""
+    fetched = []
+
+    def get_json(url, auth=True):
+        album_id = url.split("albums/")[1].split("/")[0]
+        fetched.append(album_id)
+        return {"base": "https://lr.adobe.io/v2/catalogs/c/", "resources": [{}] * sizes[album_id]}
+
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(ALBUMS))
+    monkeypatch.setattr(server.lr, "get_json", get_json)
+    return fetched
+
+
+def test_list_albums_shows_cached_counts_after_the_time_limit(monkeypatch):
+    fetched = serve_album_assets(monkeypatch, {"a": 7, "b": 8, "p": 9})
+    assert "Travel / Kyoto  (a)  7 photos" in server.lr_list_albums(query="kyoto", include_counts=True)
+    monkeypatch.setattr(server, "COUNT_SECONDS", -1)
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("4 albums (2 not counted, time limit reached")
+    assert out[1:3] == ["Travel / Kyoto  (a)  7 photos", "Travel / Osaka  (b)  ? photos"]
+    assert fetched == ["a"]  # nothing new is requested once the time is up
+
+
+def test_list_albums_does_not_wait_for_a_stuck_count(monkeypatch):
+    release = threading.Event()
+
+    def count(album_id, updated=None, deadline=None):
+        if album_id == "b":
+            release.wait(30)
+        return 5
+
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(ALBUMS))
+    monkeypatch.setattr(server.lr, "album_asset_count", count)
+    monkeypatch.setattr(server, "COUNT_SECONDS", 0)
+    monkeypatch.setattr(server, "COUNT_GRACE", 0.2)
+    t = time.monotonic()
+    try:
+        out = server.lr_list_albums(include_counts=True).splitlines()
+    finally:
+        release.set()
+    assert time.monotonic() - t < 5
+    assert out[0].startswith("4 albums (1 not counted, time limit reached")
+    assert out[1:3] == ["Travel / Kyoto  (a)  5 photos", "Travel / Osaka  (b)  ? photos"]
+
+
+def test_list_albums_counts_survive_an_unexpected_error(monkeypatch):
+    count_albums(monkeypatch, {"a": 5, "b": AttributeError("'NoneType' object has no attribute 'get'"), "p": 2})
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0] == """4 albums (1 could not be counted: AttributeError("'NoneType' object has no attribute 'get'"))"""
+    assert out[1:3] == ["Travel / Kyoto  (a)  5 photos", "Travel / Osaka  (b)  ? photos"]
+
+
+def test_list_albums_counts_when_every_album_fails(monkeypatch):
+    err = LrError("GET albums/x/assets returned 429: slow down")
+    count_albums(monkeypatch, {"a": err, "b": err, "p": err})
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0] == "4 albums (3 could not be counted: GET albums/x/assets returned 429: slow down)"
+    assert sum("? photos" in line for line in out) == 3
+
+
+def test_list_albums_with_counts_fails_clearly_when_not_signed_in(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 5, "b": 5, "p": 5})
+
+    def not_signed_in():
+        raise LrError("Not signed in. Run lr_login (or `lr-mcp login`) first.")
+
+    monkeypatch.setattr(server.lr, "access_token", not_signed_in)
+    with pytest.raises(LrError, match="Not signed in"):
+        server.lr_list_albums(include_counts=True)
+    assert calls == []
+
+
+def test_a_failed_add_still_forgets_the_album_count(monkeypatch):
+    replies = iter([(201, b'{"resources": [{"id": "x"}]}'), (500, b'{"code": 1}')])
+    monkeypatch.setattr(server.lr, "request", lambda method, path, body=None: next(replies))
+    server.lr._count_cache["p"] = ("u3", 0.0, 3)
+    with pytest.raises(LrError, match="500"):
+        server.lr_add_to_project_album("p", [f"id{i}" for i in range(60)])
+    assert "p" not in server.lr._count_cache

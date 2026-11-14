@@ -447,17 +447,24 @@ def test_album_asset_count_cache_expires(monkeypatch):
     assert len(fetched) == 2
 
 
+def slow_pages(monkeypatch, fetched):
+    """Make every fetched page take 10 s on a fake clock that starts at 0."""
+    monkeypatch.setattr(lr.time, "monotonic", lambda: 10.0 * len(fetched))
+
+
 def test_album_asset_count_gives_up_at_deadline_with_pages_left(monkeypatch):
     fetched = album_pages(monkeypatch, [500, 500, 37])
-    assert lr.album_asset_count("a", "u", deadline=time.monotonic() - 1) is None
+    slow_pages(monkeypatch, fetched)
+    assert lr.album_asset_count("a", "u", deadline=5) is None
     assert len(fetched) == 1
     assert lr._count_cache == {}  # a partial count must not be cached
     assert lr.album_asset_count("a", "u") == 1037
 
 
 def test_album_asset_count_keeps_a_count_finished_past_the_deadline(monkeypatch):
-    album_pages(monkeypatch, [37])
-    assert lr.album_asset_count("a", "u", deadline=time.monotonic() - 1) == 37
+    fetched = album_pages(monkeypatch, [37])
+    slow_pages(monkeypatch, fetched)
+    assert lr.album_asset_count("a", "u", deadline=5) == 37  # the last page arrived late, but it is complete
 
 
 def test_forget_album_count(monkeypatch):
@@ -467,3 +474,11 @@ def test_forget_album_count(monkeypatch):
     lr.forget_album_count("never-counted")
     lr.album_asset_count("a", "u")
     assert len(fetched) == 2
+
+
+def test_album_asset_count_past_the_deadline_still_answers_from_the_cache(monkeypatch):
+    fetched = album_pages(monkeypatch, [37])
+    assert lr.album_asset_count("a", "u") == 37
+    assert lr.album_asset_count("a", "u", deadline=time.monotonic() - 1) == 37
+    assert lr.album_asset_count("a", "changed", deadline=time.monotonic() - 1) is None
+    assert len(fetched) == 1  # no request is started past the deadline

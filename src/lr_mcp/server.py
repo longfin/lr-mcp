@@ -15,7 +15,7 @@ import re
 import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,7 +40,8 @@ mcp = MCPServer(
 _albums_cache = (0.0, None)
 MAX_SCAN = 20000   # assets lr_list_photos looks at before giving up
 SCAN_SECONDS = 60  # ...or the time it spends, leaving room for one slow page; clients time out at ~120 s
-COUNT_SECONDS = 60  # time lr_list_albums spends counting photos, for the same reason
+COUNT_SECONDS = 60  # time lr_list_albums spends starting photo counts, for the same reason...
+COUNT_GRACE = 15    # ...and how much longer it waits for requests already under way
 
 
 def _albums():
@@ -250,28 +251,34 @@ def lr_account() -> str:
 def _album_counts(albums):
     """({album_id: count}, note) for the given albums, counted in parallel within COUNT_SECONDS.
     Albums that ran out of time or failed are left out of the dict and explained in the note."""
-    lr.catalog_path()  # resolve once here instead of once per worker thread
+    # resolve these once here, not in every worker: a token refresh must not run six times at once
+    lr.catalog_path()
+    lr.access_token()
     deadline = time.monotonic() + COUNT_SECONDS
 
     def count(a):
-        if time.monotonic() > deadline:
-            return None
         try:
             return lr.album_asset_count(a["id"], a.get("updated"), deadline)
-        except LrError as e:
+        except Exception as e:  # one bad album or response must not lose the whole listing
             return e
 
-    with ThreadPoolExecutor(6) as ex:
-        results = list(ex.map(count, albums))
+    # No `with`: leaving it would wait for every worker, and a request that is retrying or stalled
+    # can outlast the client's timeout. Stragglers finish in the background and still fill the cache.
+    ex = ThreadPoolExecutor(6)
+    futures = [ex.submit(count, a) for a in albums]
+    done, _ = wait(futures, timeout=max(COUNT_SECONDS, 0) + COUNT_GRACE)
+    results = [f.result() if f in done else None for f in futures]
+    ex.shutdown(wait=False, cancel_futures=True)
     counts = {a["id"]: r for a, r in zip(albums, results) if isinstance(r, int)}
     late = sum(r is None for r in results)
-    errors = [r for r in results if isinstance(r, LrError)]
+    errors = [r for r in results if isinstance(r, Exception)]
     notes = []
     if late:
         notes.append(f"{late} not counted, time limit reached — call again to count the rest "
                      "(finished counts are cached), or narrow with query")
     if errors:
-        notes.append(f"{len(errors)} could not be counted: {errors[0]}")
+        e = errors[0]
+        notes.append(f"{len(errors)} could not be counted: {e if isinstance(e, LrError) else repr(e)}")
     return counts, "; ".join(notes)
 
 
@@ -610,18 +617,20 @@ def lr_create_project_album(name: str, asset_ids: list[str] | None = None) -> st
 def lr_add_to_project_album(album_id: str, asset_ids: list[str]) -> str:
     """Add photos to a project album. Albums the user created cannot be modified."""
     added, errors = 0, []
-    for i in range(0, len(asset_ids), 50):
-        chunk = asset_ids[i:i + 50]
-        status, body = lr.request("PUT", lr.catalog_path() + f"albums/{album_id}/assets",
-                                  {"resources": [{"id": a, "payload": {}} for a in chunk]})
-        data = lr.parse(body) or {}
-        if status not in (201, 403):
-            raise LrError(f"Adding photos failed ({status}): {data}")
-        # added photos come back in `resources`, failed ones per photo in top-level `errors`
-        added += len(data.get("resources", []))
-        for e in data.get("errors", []):
-            errors.append(f"{e.get('id')}: {e.get('description')} {e.get('errors', '')}")
-    lr.forget_album_count(album_id)
+    try:
+        for i in range(0, len(asset_ids), 50):
+            chunk = asset_ids[i:i + 50]
+            status, body = lr.request("PUT", lr.catalog_path() + f"albums/{album_id}/assets",
+                                      {"resources": [{"id": a, "payload": {}} for a in chunk]})
+            data = lr.parse(body) or {}
+            if status not in (201, 403):
+                raise LrError(f"Adding photos failed ({status}): {data}")
+            # added photos come back in `resources`, failed ones per photo in top-level `errors`
+            added += len(data.get("resources", []))
+            for e in data.get("errors", []):
+                errors.append(f"{e.get('id')}: {e.get('description')} {e.get('errors', '')}")
+    finally:
+        lr.forget_album_count(album_id)  # also when a later chunk fails after earlier ones were added
     msg = f"Added {added} photos"
     if errors:
         msg += f", {len(errors)} failed:\n" + "\n".join(errors[:20])

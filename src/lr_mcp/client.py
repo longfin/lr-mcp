@@ -394,12 +394,14 @@ def album_asset_count(album_id, updated=None, deadline=None):
     updated: the album's `updated` timestamp from the albums listing. A cached count is reused
     while it is unchanged and younger than COUNT_TTL. The time limit is needed because `updated`
     does not always move when photos are added to an album.
-    deadline: a time.monotonic() value. Returns None, caching nothing, when it passes while
-    pages are still left to fetch.
+    deadline: a time.monotonic() value. Returns None, caching nothing, when the count is not
+    cached and the deadline passes before the first request or while pages are still left.
     """
     hit = _count_cache.get(album_id)
     if hit and hit[0] == updated and time.monotonic() - hit[1] < COUNT_TTL:
         return hit[2]
+    if deadline is not None and time.monotonic() > deadline:
+        return None
     n = 0
     for data in _pages(catalog_path() + f"albums/{album_id}/assets?limit=500"):
         n += len(data.get("resources", []))
