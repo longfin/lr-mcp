@@ -109,7 +109,7 @@ def _outputs(monkeypatch, tmp_path):
     dest = tmp_path / "dl"
     msg = server.lr_download_photos(album_id="x", size="640", dest_dir=str(dest))
     out["lr_download_photos"] = msg.replace(str(dest), "<dest>")
-    out["lr_download_photos files"] = sorted(p.name for p in dest.iterdir())
+    out["lr_download_photos files"] = sorted(p.name for p in dest.glob("*.jpg"))  # the sidecar is compared below
     out["lr_download_photos sidecar"] = json.loads((dest / server.SIDECAR).read_text())
     return out
 

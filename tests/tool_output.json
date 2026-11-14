@@ -36,7 +36,6 @@
  "fileNameAsc lr_list_photos {\"captured_after\": \"2024-05-01\", \"captured_before\": \"2024-05-02\"}": "4 photos (scanned 5)\nbare | DSC0001.ARW | 2024-05-01T08:00:00\nreject | scan.tif | 2024-05-02T12:00:00 | reject | 0.5s | title: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…\nclip | clip.mov | 2024-05-02T13:00:00\nfull | DSC0001.ARW | 2024-05-02T18:30:00 | ★★★★★ | pick | f/1.8 1/125s ISO400 50mm | SONY ILCE-7RM5 + FE 50mm F1.2 GM | title: Harbour | caption: Boats at dusk / long exposure",
  "lr_download_photos": "Saved 4 photos to <dest>\nSkipped 1 non-image assets (videos etc.)",
  "lr_download_photos files": [
-  ".lr-mcp.json",
   "DSC0001-2.jpg",
   "DSC0001.jpg",
   "IMG_9.jpg",
