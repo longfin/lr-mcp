@@ -574,3 +574,53 @@ def test_get_without_deadline_is_unchanged_by_a_far_deadline(monkeypatch):
     with pytest.raises(lr.LrError, match="failed after 6 attempts"):
         lr.request("GET", "/v2/account", deadline=100 + 3600)
     assert slept == [1, 3, 5, 7, 9] and timeouts == [lr.REQUEST_TIMEOUT] * 6
+
+
+def _renditions(monkeypatch, replies):
+    """Answer request() from `replies` (method -> list of (status, body)); returns the calls made."""
+    calls = []
+
+    def request(method, path, **kw):
+        calls.append(method)
+        return replies[method].pop(0) if len(replies[method]) > 1 else replies[method][0]
+
+    monkeypatch.setattr(lr, "catalog_path", lambda: "/v2/catalogs/c/")
+    monkeypatch.setattr(lr, "request", request)
+    monkeypatch.setattr(lr.time, "sleep", lambda s: None)
+    return calls
+
+
+@pytest.mark.parametrize("kind, replies, retryable", [
+    ("2048", {"GET": [(404, b'{"code": 1002}')]}, False),               # no such asset
+    ("2048", {"GET": [(403, b"")]}, False),
+    ("2048", {"GET": [(503, b"")]}, True),
+    ("2048", {"GET": [(500, b"")]}, True),
+    ("fullsize", {"GET": [(404, b"")], "POST": [(202, b"")]}, True),     # still generating after the polling
+    ("fullsize", {"GET": [(404, b"")], "POST": [(403, b"")]}, False),
+    ("fullsize", {"GET": [(404, b"")], "POST": [(429, b"")]}, True),
+])
+def test_rendition_errors_say_whether_to_retry(monkeypatch, kind, replies, retryable):
+    _renditions(monkeypatch, replies)
+    with pytest.raises(lr.LrError) as e:
+        lr.rendition("a1", kind)
+    assert e.value.retryable is retryable
+
+
+def test_rendition_polls_until_generated(monkeypatch):
+    calls = _renditions(monkeypatch, {"GET": [(404, b""), (404, b""), (200, b"jpeg")], "POST": [(202, b"")]})
+    assert lr.rendition("a1", "2560") == b"jpeg"
+    assert calls == ["GET", "POST", "GET", "GET"]
+
+
+def test_network_failures_say_whether_to_retry(monkeypatch):
+    _client(monkeypatch)
+    monkeypatch.setattr(lr.urllib.request, "urlopen", lambda req, timeout=None: (_ for _ in ()).throw(
+        ConnectionResetError("reset")))
+    with pytest.raises(lr.LrError) as e:
+        lr.request("GET", "/v2/account")
+    assert e.value.retryable is True
+    monkeypatch.setattr(lr.urllib.request, "urlopen", lambda req, timeout=None: (_ for _ in ()).throw(
+        lr.urllib.error.URLError(lr.socket.gaierror(8, "nodename nor servname provided"))))
+    with pytest.raises(lr.LrError) as e:
+        lr.request("GET", "/v2/account")
+    assert e.value.retryable is False

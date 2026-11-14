@@ -7,17 +7,25 @@
                 save the credential from a JSON file downloaded from the Adobe Developer Console
 """
 import asyncio
+import contextlib
 import itertools
 import json
 import math
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 from mcp.server.mcpserver import Image, MCPServer
 
@@ -471,6 +479,9 @@ def lr_view_photos(asset_ids: list[str], size: str = "640") -> list:
 
 
 SIDECAR = ".lr-mcp.json"
+SIDECAR_LOCK = SIDECAR + ".lock"  # held while the sidecar is merged; kept in the folder
+SIDECAR_FLUSH_SECONDS = 2  # saved photos are recorded at least this often, so an interrupted run keeps them
+DOWNLOAD_ATTEMPTS = 3      # tries per photo for failures that may pass (see lr.rendition)
 
 
 def _edited(asset):
@@ -489,15 +500,91 @@ def _read_sidecar(dest):
         return {}
 
 
+def _write_atomic(path, data):
+    """Write to a temp file of this writer's own in the same folder, then rename it over `path`, so
+    `path` never holds a partial file. The temp file is removed when the write or rename fails."""
+    tmp = path.with_name(f".{path.name.lstrip('.')}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "xb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _write_sidecar(dest, entries):
     """Atomic write; returns an error string instead of raising, since the photos are already saved."""
-    tmp = dest / f"{SIDECAR}.{uuid.uuid4().hex}.tmp"
     try:
-        tmp.write_text(json.dumps(entries, indent=1, sort_keys=True))
-        os.replace(tmp, dest / SIDECAR)
+        _write_atomic(dest / SIDECAR, json.dumps(entries, indent=1, sort_keys=True).encode())
     except OSError as e:
-        tmp.unlink(missing_ok=True)
         return f"could not write {SIDECAR} ({e}); the next call will download these again"
+
+
+@contextlib.contextmanager
+def _folder_lock(dest):
+    """Exclusive lock on <dest>/.lr-mcp.json.lock, so two processes saving into one folder do not
+    lose each other's sidecar entries."""
+    with open(dest / SIDECAR_LOCK, "a+b") as f:
+        if fcntl:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        else:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            else:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+class _Sidecar:
+    """Entries of photos saved by one call, merged into <dest>/.lr-mcp.json while the downloads run
+    (at most every SIDECAR_FLUSH_SECONDS) and once at the end. Each merge re-reads the file under
+    the folder lock, so entries written meanwhile by another call are kept."""
+
+    def __init__(self, dest):
+        self.dest, self.pending, self.last = dest, {}, time.monotonic()
+        self.lock = threading.Lock()
+
+    def add(self, name, entry):
+        with self.lock:
+            self.pending[name] = entry
+            if time.monotonic() - self.last >= SIDECAR_FLUSH_SECONDS:
+                self._flush()  # a failure here is retried at the next flush
+
+    def flush(self):
+        """Merge what is pending; returns an error string or None."""
+        with self.lock:
+            return self._flush()
+
+    def _flush(self):
+        self.last = time.monotonic()
+        if not self.pending:
+            return None
+        try:
+            with _folder_lock(self.dest):
+                error = _write_sidecar(self.dest, {**_read_sidecar(self.dest), **self.pending})
+        except OSError as e:
+            error = f"could not write {SIDECAR} ({e}); the next call will download these again"
+        if error is None:
+            self.pending.clear()
+        return error
+
+
+def _rendition(asset_id, size):
+    """lr.rendition, tried up to DOWNLOAD_ATTEMPTS times with backoff when the failure is retryable
+    (a rendition still being generated, a 429/5xx status, a dropped connection)."""
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        try:
+            return lr.rendition(asset_id, size)
+        except LrError as e:
+            if attempt + 1 == DOWNLOAD_ATTEMPTS or not getattr(e, "retryable", False):
+                raise
+        time.sleep(lr._backoff(attempt))
 
 
 @mcp.tool()
@@ -507,17 +594,25 @@ def lr_download_photos(
     size: str = "2048",
     dest_dir: str | None = None,
     force: bool = False,
+    naming: str = "file",
 ) -> str:
     """Save photos as JPEG files. Pass either asset_ids or album_id (the whole album).
     size: '640' | '1280' | '2048' | '2560' | 'fullsize' (original resolution with edits; slower).
     dest_dir defaults to ~/Downloads/lightroom/<album name or export-timestamp>.
-    Files are named after the original file name with a .jpg extension.
-    <dest_dir>/.lr-mcp.json records what was saved; on the next call into the same folder, photos
-    whose file, size and edit time are unchanged are skipped. This needs a stable folder: album_id
-    or an explicit dest_dir (asset_ids alone get a new export-<timestamp> folder each time).
-    force=True re-downloads everything, e.g. if a saved file looks stale."""
+    naming: 'file' (default) names files after the original file name with a .jpg extension
+    (IMG_1.jpg, then IMG_1-2.jpg for a second photo with that name); 'id' names them <asset id>.jpg,
+    which stays the same when a photo is renamed.
+    <dest_dir>/.lr-mcp.json records what was saved, updated while the downloads run, so an
+    interrupted call keeps its progress; on the next call into the same folder, photos whose file,
+    size and edit time are unchanged are skipped. This needs a stable folder: album_id or an
+    explicit dest_dir (asset_ids alone get a new export-<timestamp> folder each time).
+    force=True re-downloads everything, e.g. if a saved file looks stale.
+    Each file is written under a temporary name and renamed when complete. A photo whose rendition
+    fails for a reason that may pass (still being generated, server busy) is tried up to 3 times."""
     if size not in ("640", "1280", "2048", "2560", "fullsize"):
         raise LrError("size must be one of 640, 1280, 2048, 2560, fullsize")
+    if naming not in ("file", "id"):
+        raise LrError("naming must be 'file' or 'id'")
     if album_id:
         assets = [aa["asset"] for aa in lr.paginate(lr.catalog_path() + f"albums/{album_id}/assets?embed=asset&limit=500")]
         name = _album_paths().get(album_id, album_id).split(" / ")[-1]
@@ -535,6 +630,8 @@ def lr_download_photos(
     used = set()
 
     def target(a):
+        if naming == "id":
+            return dest / f"{a['id']}.jpg"
         stem = Path(a["payload"].get("importSource", {}).get("fileName") or a["id"]).stem
         base, n = stem, 1
         while stem in used:
@@ -563,20 +660,24 @@ def lr_download_photos(
             unchanged += 1
         else:
             jobs.append((aid, path, updated))
-    errors, saved = [], {}
+    errors, saved, sidecar = [], {}, _Sidecar(dest)
 
     def fetch(job):
         aid, path, updated = job
         try:
-            data = lr.rendition(aid, size)
-            path.write_bytes(data)
-            saved[path.name] = {"asset_id": aid, "size": size, "updated": updated, "bytes": len(data)}
+            data = _rendition(aid, size)
+            _write_atomic(path, data)
         except (LrError, OSError) as e:
             errors.append(f"{aid}: {e}")
+            return
+        saved[path.name] = {"asset_id": aid, "size": size, "updated": updated, "bytes": len(data)}
+        sidecar.add(path.name, saved[path.name])
 
-    with ThreadPoolExecutor(6) as ex:
-        list(ex.map(fetch, jobs))
-    warning = _write_sidecar(dest, {**_read_sidecar(dest), **saved}) if saved else None
+    try:
+        with ThreadPoolExecutor(6) as ex:
+            list(ex.map(fetch, jobs))
+    finally:
+        warning = sidecar.flush()  # also when the call is interrupted
     skipped = len(assets) - len(jobs) - unchanged
     msg = f"Saved {len(saved)} photos to {dest}"
     if unchanged:
