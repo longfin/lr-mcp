@@ -149,6 +149,28 @@ If a user asks you to set this server up:
 - The MCP server reads `.env` only when it starts. If the client already had the server registered and running when you ran `setup`, tell the user to restart the client (quit and reopen Claude Desktop, or start a new Claude Code session) before using the `lr_*` tools.
 - Setup is done when `doctor` prints `Catalog found. Setup is complete.` Add the client config (step 5) before or after that. If a `lightroom` entry already exists in the client, show the user what it runs and ask before replacing it. When reading `claude mcp get` output or `claude_desktop_config.json`, show only commands and env variable names, never env values: they may hold other servers' secrets. For Claude Desktop, merge into the existing JSON instead of overwriting it, use the absolute path from `which lr-mcp`, pass `LR_MCP_HOME` in `"env"` if it is set, and tell the user to quit and reopen the app. For Claude Code, register the absolute path and tell the user to start a new session.
 
+## Python API
+
+Other Python tools can read the catalog through the same code the MCP tools use, without starting the server. It needs the same setup and sign-in (`lr-mcp doctor`), and it is read-only. The functions below and the shapes they return are stable: fields may be added, but renaming or removing one, or changing what it means, is a breaking change that the release notes announce.
+
+```python
+from lr_mcp import catalog
+
+info = catalog.album_info(album_id)
+for entry in catalog.album_assets(album_id):           # the album's own order, images only
+    photo = catalog.asset_summary(entry["asset"])
+    print(entry["order"], photo["file"], photo["keywords"], photo["cropped"])
+```
+
+| Function | Returns |
+|---|---|
+| `catalog.album_info(album_id)` | `{"id", "name", "parent", "subtype", "sort"}`. `parent` is the folder id or `None`; `subtype` is `collection`, `collection_set` (folder) or `project`; `sort` is `captureDateAsc`, `captureDateDesc` or `customAsc` (`captureDateAsc` when the album has none; another value is passed through). Fetched at most once a minute. |
+| `catalog.album_assets(album_id, images_only=True)` | A list of `{"asset", "order"}` in the album's order: the custom order when the album uses one (assets without an order key last, by capture date), else capture date ascending or descending. `asset` is the asset resource as the API returns it; `order` is the album-asset sort key as a string, or `None`. `images_only=False` keeps videos. |
+| `catalog.asset_summary(asset)` | `id`, `subtype`, `file`, `captured`, `rating`, `flag`, `camera`, `lens`, `iso`, `fnumber`, `shutter` (`"1/250"`), `exposure_time` (seconds), `focal_length` (mm), `original` and `cropped` (`(width, height)`), `orientation` (EXIF value; sizes are not swapped for it), `gps` (`(latitude, longitude)`), `title`, `caption`, `keywords` (a list, `[]` when none), `edited`. Missing values are `None`. |
+| `catalog.asset_edited(asset)` | The asset's edit timestamp (`develop.userUpdated`, else `userUpdated`, else `changedAtTime`), or `None`. It moves when develop settings or the crop change, not on rating or flag edits. |
+
+Errors are raised as `lr_mcp.catalog.LrError`; an unknown album id gives `Album not found: <id>. ...`. `lr_mcp.client.album_asset_count(album_id)` counts an album's assets (videos included) without reading them.
+
 ## Development
 
 ```bash

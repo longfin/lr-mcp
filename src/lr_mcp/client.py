@@ -49,7 +49,9 @@ LR = "https://lr.adobe.io"
 
 
 class LrError(ToolError):
-    """Subclasses ToolError so the message reaches the model instead of a generic error."""
+    """Subclasses ToolError so the message reaches the model instead of a generic error.
+    status: the HTTP status when get_json got an error response, else None."""
+    status = None
 
 
 def parse_env(text):
@@ -362,7 +364,9 @@ def get_json(path, auth=True, deadline=None):
     status, body = request("GET", path, auth=auth, deadline=deadline)
     data = parse(body)
     if status != 200:
-        raise LrError(f"GET {path} returned {status}: {data}")
+        e = LrError(f"GET {path} returned {status}: {data}")
+        e.status = status
+        raise e
     return data
 
 
