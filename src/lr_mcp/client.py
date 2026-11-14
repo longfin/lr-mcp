@@ -50,8 +50,19 @@ LR = "https://lr.adobe.io"
 
 class LrError(ToolError):
     """Subclasses ToolError so the message reaches the model instead of a generic error.
+    status: the HTTP status when the error comes from an HTTP response, else None.
     retryable: True when trying the same call again later may succeed (see rendition)."""
+    status = None
     retryable = False
+
+
+def _http_error(message, status, retryable=False):
+    """An LrError with the HTTP status of the response it comes from (None for a failure without
+    a response) and whether trying the same call again later may succeed."""
+    e = LrError(message)
+    e.status = status
+    e.retryable = retryable
+    return e
 
 
 def parse_env(text):
@@ -179,7 +190,7 @@ def _token_request(params):
         with urllib.request.urlopen(req) as r:
             tok = json.load(r)
     except urllib.error.HTTPError as e:
-        raise LrError(f"Token request failed ({e.code}): {e.read().decode()}")
+        raise _http_error(f"Token request failed ({e.code}): {e.read().decode()}", e.code)
     tok["obtained_at"] = int(time.time())
     if "refresh_token" not in tok and TOKEN_FILE.exists():
         # a refresh response may omit refresh_token; keep the existing one
@@ -311,16 +322,6 @@ def _transient_status(status):
     return status in RETRY_STATUSES or status >= 500
 
 
-def _error(message, retryable, status=None):
-    """An LrError whose `retryable` says whether trying the same call again later may succeed;
-    `status` is the HTTP status when the error comes from a response."""
-    e = LrError(message)
-    e.retryable = retryable
-    if status is not None:
-        e.status = status
-    return e
-
-
 def _too_late(deadline, delay):
     return deadline is not None and time.monotonic() + delay > deadline
 
@@ -360,8 +361,8 @@ def request(method, path, body=None, content_type="application/json", auth=True,
             delay = None if last or _permanent(e) else _backoff(attempt)
             if delay is None or _too_late(deadline, delay):
                 # a GET has had its retries here already; a write had one attempt
-                raise _error(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}",
-                             method != "GET" and not _permanent(e)) from e
+                raise _http_error(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}",
+                                  None, method != "GET" and not _permanent(e)) from e
         time.sleep(delay)
 
 
@@ -380,7 +381,7 @@ def get_json(path, auth=True, deadline=None):
     status, body = request("GET", path, auth=auth, deadline=deadline)
     data = parse(body)
     if status != 200:
-        raise LrError(f"GET {path} returned {status}: {data}")
+        raise _http_error(f"GET {path} returned {status}: {data}", status)
     return data
 
 
@@ -470,7 +471,7 @@ def rendition(asset_id, kind):
                          body=b"", content_type="application/octet-stream",
                          headers={"X-Generate-Renditions": kind})
         if gs != 202:
-            raise _error(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}", _transient_status(gs), gs)
+            raise _http_error(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}", gs, _transient_status(gs))
         generating = True
         for _ in range(30):
             time.sleep(2)
@@ -478,6 +479,6 @@ def rendition(asset_id, kind):
             if status == 200:
                 break
     if status != 200:
-        raise _error(f"Rendition {kind} for {asset_id} failed ({status}): {parse(body)}",
-                     generating and status == 404, status)
+        raise _http_error(f"Rendition {kind} for {asset_id} failed ({status}): {parse(body)}", status,
+                          generating and status == 404)
     return body

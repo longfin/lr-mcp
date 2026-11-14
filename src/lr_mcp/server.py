@@ -11,7 +11,6 @@ import contextlib
 import errno
 import itertools
 import json
-import math
 import os
 import re
 import sys
@@ -30,6 +29,7 @@ except ImportError:  # Windows
 
 from mcp.server.mcpserver import Image, MCPServer
 
+from . import catalog
 from . import client as lr
 from .client import LrError
 
@@ -72,62 +72,25 @@ def _album_paths():
     return {aid: path(a) for aid, a in items.items()}
 
 
-_album_cache = {}
-ALBUM_TTL = 60  # seconds an album's sort mode is trusted; the user may be reordering it right now
-SORT_MODES = ("captureDateAsc", "captureDateDesc", "customAsc")
+_album_cache = catalog._album_cache  # the same dict: one cache for the tools and catalog.album_info
+ALBUM_TTL = catalog.ALBUM_TTL
+SORT_MODES = catalog.SORT_MODES
+
+
+def _oneline(v):
+    """Text for a one-line listing: whitespace collapsed, '|' (the field separator) replaced by '/'."""
+    return (" ".join(v.replace("|", "/").split()) or None) if v else None
+
+
+def _text(v):
+    return _oneline(catalog._text(v))
 
 
 def _album_sort_order(album_id):
-    """payload.assetSortOrder of one album: captureDateAsc | captureDateDesc | customAsc, or an
-    unknown value passed through as-is (captureDateAsc when missing)."""
+    """Sort mode of one album (see catalog.album_info), from the album listing when it is fresh."""
     ts, items = _albums_cache
     a = next((a for a in items or [] if a["id"] == album_id), None) if time.time() - ts <= ALBUM_TTL else None
-    if a is None:
-        ts, a = _album_cache.get(album_id, (0.0, None))
-        if a is None or time.time() - ts > ALBUM_TTL:
-            a = lr.get_json(lr.catalog_path() + f"albums/{album_id}")
-            _album_cache[album_id] = (time.time(), a)
-    return (a.get("payload") or {}).get("assetSortOrder") or "captureDateAsc"
-
-
-def _frac(v):
-    if isinstance(v, list) and len(v) == 2 and v[1]:
-        return v[0] / v[1]
-    return v
-
-
-def _latest(d, key):
-    """ratings/reviews are shaped {user_id: {key, date}}; return the most recent value."""
-    if not d:
-        return None
-    v = max(d.values(), key=lambda x: x.get("date", ""))
-    return v.get(key)
-
-
-def _text(v, depth=0):
-    """A dc string: plain, a language alternative {"x-default": ...}, {"description": ...} or a
-    one-element list of those; whitespace and '|' collapsed so it stays on one line."""
-    if isinstance(v, list):
-        v = v[0] if v else None
-    if isinstance(v, dict) and depth < 2:
-        xd = v.get("x-default")
-        v = xd if isinstance(xd, str) and xd.strip() else next((x for x in v.values() if _text(x, depth + 1)), None)
-        return _text(v, depth + 1)
-    return (" ".join(v.replace("|", "/").split()) or None) if isinstance(v, str) else None
-
-
-def _keywords(v):
-    """dc.subject as a list of strings or a {keyword: true} map."""
-    if isinstance(v, dict):
-        v = [k for k, on in v.items() if on]
-    if isinstance(v, str):
-        v = [v]
-    kw = [t for t in (_text(x) for x in v or []) if t] if isinstance(v, list) else []
-    return ", ".join(kw) or None
-
-
-def _num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    return catalog._sort_mode(a) if a is not None else catalog.album_info(album_id)["sort"]
 
 
 def _clip(v, n=60):
@@ -135,37 +98,29 @@ def _clip(v, n=60):
 
 
 def _summary(asset):
-    p = asset.get("payload", {})
-    xmp = p.get("xmp") or {}
-    exif, tiff, dc = xmp.get("exif") or {}, xmp.get("tiff") or {}, xmp.get("dc") or {}
-    dev, loc, imp = p.get("develop") or {}, p.get("location") or {}, p.get("importSource") or {}
-    cw, ch = dev.get("croppedWidth"), dev.get("croppedHeight")
-    lat, lon = loc.get("latitude"), loc.get("longitude")
-    shutter = exif.get("ExposureTime")
-    if isinstance(shutter, list) and len(shutter) == 2 and shutter[1]:
-        shutter = f"{shutter[0]}/{shutter[1]}" if shutter[0] < shutter[1] else f"{shutter[0] / shutter[1]:g}"
-    fnum = _frac(exif.get("FNumber"))
-    focal = _frac(exif.get("FocalLength"))
+    """catalog.asset_summary formatted for the tools: numbers and lists become short strings."""
+    d = catalog.asset_summary(asset)
+    fnum, focal, size, cropped, gps = d["fnumber"], d["focal_length"], d["original"], d["cropped"], d["gps"]
     return {
-        "id": asset["id"],
-        "type": asset.get("subtype"),
-        "file": imp.get("fileName"),
-        "captured": p.get("captureDate"),
-        "rating": _latest(p.get("ratings"), "rating"),
-        "flag": _latest(p.get("reviews"), "flag"),
-        "camera": " ".join(filter(None, [tiff.get("Make"), tiff.get("Model")])) or None,
-        "lens": (xmp.get("aux") or {}).get("Lens"),
-        "iso": exif.get("ISOSpeedRatings"),
-        "aperture": f"f/{fnum:g}" if _num(fnum) else None,
-        "shutter": shutter,
-        "focal_mm": round(focal) if _num(focal) else None,
-        "size": f"{imp.get('originalWidth')}x{imp.get('originalHeight')}" if imp.get("originalWidth") else None,
-        "cropped": f"{round(cw)}x{round(ch)}" if _num(cw) and _num(ch) else None,
-        "orientation": dev.get("userOrientation") if _num(dev.get("userOrientation")) else None,
-        "gps": f"{lat},{lon}" if _num(lat) and _num(lon) else None,
-        "title": _text(dc.get("title")),
-        "caption": _text(dc.get("description")),
-        "keywords": _keywords(dc.get("subject")),
+        "id": d["id"],
+        "type": d["subtype"],
+        "file": d["file"],
+        "captured": d["captured"],
+        "rating": d["rating"],
+        "flag": d["flag"],
+        "camera": d["camera"],
+        "lens": d["lens"],
+        "iso": d["iso"],
+        "aperture": f"f/{fnum:g}" if fnum is not None else None,
+        "shutter": d["shutter"],
+        "focal_mm": round(focal) if focal is not None else None,
+        "size": f"{size[0]}x{size[1]}" if size else None,
+        "cropped": f"{round(cropped[0])}x{round(cropped[1])}" if cropped else None,
+        "orientation": d["orientation"],
+        "gps": f"{gps[0]},{gps[1]}" if gps else None,
+        "title": _oneline(d["title"]),
+        "caption": _oneline(d["caption"]),
+        "keywords": ", ".join(_oneline(k) for k in d["keywords"]) or None,
     }
 
 
@@ -190,9 +145,8 @@ def _fmt(s):
 def _iter_assets(album_id, captured_after, captured_before):
     """Yield (asset, order); order is the album-asset payload.order sort key, None outside an album."""
     if album_id:
-        for aa in lr.paginate(lr.catalog_path() + f"albums/{album_id}/assets?embed=asset&limit=500"):
-            order = (aa.get("payload") or {}).get("order")
-            yield aa["asset"], None if order is None else str(order)
+        for e in catalog._album_entries(album_id):
+            yield e["asset"], e["order"]
         return
     # the API rejects captured_after together with captured_before, so walk forward
     # from captured_after and let the caller stop at captured_before
@@ -204,9 +158,7 @@ def _iter_assets(album_id, captured_after, captured_before):
 
 
 def _fnumber(asset):
-    xmp = (asset.get("payload") or {}).get("xmp") or {}
-    v = _frac((xmp.get("exif") or {}).get("FNumber"))
-    return v if _num(v) else None
+    return catalog.asset_summary(asset)["fnumber"]
 
 
 def _in_hours(captured, hour_from, hour_to):
@@ -410,7 +362,7 @@ def lr_list_photos(
             if f is None or (max_fnumber is not None and f > max_fnumber) \
                     or (min_fnumber is not None and f < min_fnumber):
                 continue
-        out.append((s, order))
+        out.append({"asset": a, "order": order, "summary": s})
         if not album_id and len(out) >= limit:
             break  # an album is sorted after the scan, so it is cut to limit only then
     else:
@@ -418,10 +370,8 @@ def lr_list_photos(
         if scanned >= MAX_SCAN:
             partial = "scan limit reached"
     if album_id:
-        out.sort(key=lambda so: so[0]["captured"] or "", reverse=sort == "album" and mode == "captureDateDesc")
-        if sort == "album" and mode == "customAsc":
-            out.sort(key=lambda so: (so[1] is None, so[1] or ""))  # stable: ties keep capture order
-    out = [s for s, _ in out[:limit]]
+        out = catalog._in_album_order(out, mode if sort == "album" else "captureDateAsc")
+    out = [e["summary"] for e in out[:limit]]
     note = ", limit reached" if len(out) >= limit else ""
     if album_id:
         label = mode if mode in SORT_MODES else f"{mode} (unsupported, sorted by capture)"
@@ -489,12 +439,7 @@ _TEMP = re.compile(r"\..+\.[0-9a-f]{32}\.tmp")  # _write_atomic's temp file name
 _NO_LOCKS = {errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)}
 
 
-def _edited(asset):
-    """Edit timestamp for the download cache. develop.userUpdated moves only when develop
-    settings (incl. crop) change, so rating/flag edits don't force a re-download; fall back to
-    the asset-wide userUpdated, then changedAtTime. None means always re-download."""
-    p = asset.get("payload") or {}
-    return (p.get("develop") or {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
+_edited = catalog.asset_edited  # edit timestamp for the download cache; None means always re-download
 
 
 def _read_sidecar(dest):
@@ -656,7 +601,7 @@ def lr_download_photos(
     if naming not in ("file", "id"):
         raise LrError("naming must be 'file' or 'id'")
     if album_id:
-        assets = [aa["asset"] for aa in lr.paginate(lr.catalog_path() + f"albums/{album_id}/assets?embed=asset&limit=500")]
+        assets = [e["asset"] for e in catalog._album_entries(album_id)]  # API page order, so -2/-3 suffixes stay as before
         name = _album_paths().get(album_id, album_id).split(" / ")[-1]
     elif asset_ids:
         assets = []
@@ -758,7 +703,7 @@ def lr_create_project_album(name: str, asset_ids: list[str] | None = None) -> st
                     "publishInfo": {"version": 3, "created": now, "updated": now}},
     })
     if status != 201:
-        raise LrError(f"Creating the album failed ({status}): {lr.parse(body)}")
+        raise lr._http_error(f"Creating the album failed ({status}): {lr.parse(body)}", status)
     global _albums_cache
     _albums_cache = (0.0, None)
     msg = f"Created album {name} ({album_id})"
@@ -778,7 +723,7 @@ def lr_add_to_project_album(album_id: str, asset_ids: list[str]) -> str:
                                       {"resources": [{"id": a, "payload": {}} for a in chunk]})
             data = lr.parse(body) or {}
             if status not in (201, 403):
-                raise LrError(f"Adding photos failed ({status}): {data}")
+                raise lr._http_error(f"Adding photos failed ({status}): {data}", status)
             # added photos come back in `resources`, failed ones per photo in top-level `errors`
             added += len(data.get("resources", []))
             for e in data.get("errors", []):
@@ -796,7 +741,7 @@ def lr_delete_project_album(album_id: str) -> str:
     """Delete a project album created by this server. Only the album is removed; photos stay in the catalog."""
     status, body = lr.request("DELETE", lr.catalog_path() + f"albums/{album_id}")
     if status != 204:
-        raise LrError(f"Deleting the album failed ({status}): {lr.parse(body)}")
+        raise lr._http_error(f"Deleting the album failed ({status}): {lr.parse(body)}", status)
     global _albums_cache
     _albums_cache = (0.0, None)
     lr.forget_album_count(album_id)
