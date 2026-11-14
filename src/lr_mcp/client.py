@@ -23,6 +23,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -304,8 +305,15 @@ def _retry_after(headers, attempt):
     return min(int(v), 10) if v.isascii() and v.isdigit() else _backoff(attempt)
 
 
-def request(method, path, body=None, content_type="application/json", auth=True, headers=None):
-    """`path` is '/v2/...' or an absolute URL. Returns (status, bytes)."""
+def _too_late(deadline, delay):
+    return deadline is not None and time.monotonic() + delay > deadline
+
+
+def request(method, path, body=None, content_type="application/json", auth=True, headers=None, deadline=None):
+    """`path` is '/v2/...' or an absolute URL. Returns (status, bytes).
+    deadline: a time.monotonic() value that bounds a GET's retries: no retry is started that would
+    begin after it, and an attempt waits no longer for each read than the time left (at least 1 s).
+    A response that keeps arriving slowly is still read to the end."""
     headers = {"X-API-Key": client_id(), **(headers or {})}
     if auth:
         headers["Authorization"] = f"Bearer {access_token()}"
@@ -320,19 +328,22 @@ def request(method, path, body=None, content_type="application/json", auth=True,
     attempts = GET_ATTEMPTS if method == "GET" else 1
     for attempt in range(attempts):
         last = attempt + 1 == attempts
+        timeout = REQUEST_TIMEOUT
+        if deadline is not None:
+            timeout = min(timeout, max(deadline - time.monotonic(), 1))
         try:
             try:
-                with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
                     return r.status, r.read()
             except urllib.error.HTTPError as e:
                 status, body = e.code, e.read()
-                if last or status not in RETRY_STATUSES:
+                delay = None if last or status not in RETRY_STATUSES else _retry_after(e.headers, attempt)
+                if delay is None or _too_late(deadline, delay):
                     return status, body
-                delay = _retry_after(e.headers, attempt)
         except (http.client.HTTPException, urllib.error.URLError, OSError) as e:
-            if last or _permanent(e):
+            delay = None if last or _permanent(e) else _backoff(attempt)
+            if delay is None or _too_late(deadline, delay):
                 raise LrError(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}") from e
-            delay = _backoff(attempt)
         time.sleep(delay)
 
 
@@ -347,8 +358,8 @@ def parse(body):
         return text
 
 
-def get_json(path, auth=True):
-    status, body = request("GET", path, auth=auth)
+def get_json(path, auth=True, deadline=None):
+    status, body = request("GET", path, auth=auth, deadline=deadline)
     data = parse(body)
     if status != 200:
         raise LrError(f"GET {path} returned {status}: {data}")
@@ -365,14 +376,66 @@ def catalog_path():
     return _catalog
 
 
-def paginate(path):
-    """Yield `resources` across pages. `links.next.href` is relative to the response's `base`."""
+def _pages(path, deadline=None):
+    """Yield each page's response. `links.next.href` is relative to the response's `base`.
+    `deadline` bounds each request's retries (see request)."""
     url = LR + path
     while url:
-        data = get_json(url)
-        yield from data.get("resources", [])
+        data = get_json(url, deadline=deadline)
+        yield data
         nxt = data.get("links", {}).get("next", {}).get("href")
         url = urllib.parse.urljoin(data["base"], nxt) if nxt else None
+
+
+def paginate(path):
+    """Yield `resources` across pages."""
+    for data in _pages(path):
+        yield from data.get("resources", [])
+
+
+COUNT_TTL = 600     # seconds a count is trusted; see album_asset_count
+_count_cache = {}   # album_id -> (album `updated`, time.monotonic() when counted, count)
+_count_gen = {}     # album_id -> times forget_album_count was called, so a count under way is not kept
+_count_lock = threading.Lock()  # counts run in parallel, and forget_album_count may come from another tool call
+
+
+def album_asset_count(album_id, updated=None, deadline=None):
+    """Number of assets (photos and videos) in an album.
+
+    The API has no count field, so this pages through the album's asset list without embedding
+    the assets: one small request per 500 assets.
+
+    updated: the album's `updated` timestamp from the albums listing. A cached count is reused
+    while it is unchanged and younger than COUNT_TTL. The time limit is needed because `updated`
+    does not always move when photos are added to an album.
+    deadline: a time.monotonic() value. Returns None, caching nothing, when the count is not
+    cached and the deadline passes before the first request or while pages are still left.
+    Requests stop retrying at the deadline, so the call normally returns or raises soon after it.
+    """
+    hit = _count_cache.get(album_id)
+    if hit and hit[0] == updated and time.monotonic() - hit[1] < COUNT_TTL:
+        return hit[2]
+    if deadline is not None and time.monotonic() > deadline:
+        return None
+    gen = _count_gen.get(album_id, 0)
+    n = 0
+    for data in _pages(catalog_path() + f"albums/{album_id}/assets?limit=500", deadline):
+        n += len(data.get("resources", []))
+        more = data.get("links", {}).get("next", {}).get("href")
+        if more and deadline is not None and time.monotonic() > deadline:
+            return None
+    with _count_lock:
+        if _count_gen.get(album_id, 0) == gen:  # else the album changed while it was being counted
+            _count_cache[album_id] = (updated, time.monotonic(), n)
+    return n
+
+
+def forget_album_count(album_id):
+    """Drop the cached count of an album whose contents were just changed, and keep a count
+    of it that is under way in another thread from being cached."""
+    with _count_lock:
+        _count_gen[album_id] = _count_gen.get(album_id, 0) + 1
+        _count_cache.pop(album_id, None)
 
 
 def rendition(asset_id, kind):

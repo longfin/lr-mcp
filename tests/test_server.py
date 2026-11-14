@@ -1,4 +1,5 @@
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,9 @@ def catalog(monkeypatch):
     monkeypatch.setattr(server.lr, "catalog_path", lambda: "/v2/catalogs/c/")
     server._albums_cache = (0.0, None)
     server._album_cache.clear()
+    server.lr._count_cache.clear()
+    server.lr._count_gen.clear()
+    monkeypatch.setattr(server.lr, "access_token", lambda: "token")
     monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {}})
 
 
@@ -580,3 +584,162 @@ def test_download_sidecar_write_failure_is_a_warning(tmp_path, lib, monkeypatch)
 def test_edited_survives_null_develop():
     assert server._edited({"id": "x", "payload": {"develop": None, "userUpdated": "2024-01-01T00:00:00Z"}}) == "2024-01-01T00:00:00Z"
     assert server._edited({"id": "x", "payload": None}) is None
+
+
+ALBUMS = [
+    {"id": "f", "subtype": "collection_set", "updated": "u0", "payload": {"name": "Travel"}},
+    {"id": "a", "subtype": "collection", "updated": "u1", "payload": {"name": "Kyoto", "parent": {"id": "f"}}},
+    {"id": "b", "subtype": "collection", "updated": "u2", "payload": {"name": "Osaka", "parent": {"id": "f"}}},
+    {"id": "p", "subtype": "project", "updated": "u3", "payload": {"name": "Picks"}},
+]
+
+
+def count_albums(monkeypatch, sizes):
+    """Serve ALBUMS and count from `sizes`; returns the list of (album_id, updated) that were counted."""
+    calls = []
+
+    def count(album_id, updated=None, deadline=None):
+        calls.append((album_id, updated))
+        if deadline is not None and time.monotonic() > deadline:
+            return None
+        n = sizes[album_id]
+        if isinstance(n, Exception):
+            raise n
+        return n
+
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(ALBUMS))
+    monkeypatch.setattr(server.lr, "album_asset_count", count)
+    return calls
+
+
+def test_list_albums_does_not_count_by_default(monkeypatch):
+    calls = count_albums(monkeypatch, {})
+    assert server.lr_list_albums().splitlines() == [
+        "4 albums", "Travel / Kyoto  (a)", "Travel / Osaka  (b)", "[folder] Travel  (f)", "[project] Picks  (p)"]
+    assert calls == []
+
+
+def test_list_albums_with_counts(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 112, "b": 1, "p": 0})
+    assert server.lr_list_albums(include_counts=True).splitlines() == [
+        "4 albums",
+        "Travel / Kyoto  (a)  112 photos",
+        "Travel / Osaka  (b)  1 photo",
+        "[folder] Travel  (f)",  # folders are not counted
+        "[project] Picks  (p)  0 photos",
+    ]
+    assert sorted(calls) == [("a", "u1"), ("b", "u2"), ("p", "u3")]
+
+
+def test_list_albums_counts_only_albums_matching_query(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 20})
+    assert server.lr_list_albums(query="kyoto", include_counts=True) == "1 albums\nTravel / Kyoto  (a)  20 photos"
+    assert calls == [("a", "u1")]
+
+
+def test_list_albums_counts_stop_at_time_limit(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 5, "b": 5, "p": 5})
+    monkeypatch.setattr(server, "COUNT_SECONDS", -1)
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("4 albums (3 not counted, time limit reached")
+    assert out[1:] == ["Travel / Kyoto  (a)  ? photos", "Travel / Osaka  (b)  ? photos", "[folder] Travel  (f)",
+                       "[project] Picks  (p)  ? photos"]
+    assert sorted(calls) == [("a", "u1"), ("b", "u2"), ("p", "u3")]  # each is asked, for its cached count
+
+
+def test_list_albums_counts_album_cut_off_midway(monkeypatch):
+    count_albums(monkeypatch, {"a": 5, "b": None, "p": 5})  # None: the deadline passed between pages
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("4 albums (1 not counted, time limit reached")
+    assert "Travel / Osaka  (b)  ? photos" in out and "Travel / Kyoto  (a)  5 photos" in out
+
+
+def test_list_albums_counts_survive_one_failing_album(monkeypatch):
+    count_albums(monkeypatch, {"a": 5, "b": LrError("GET albums/b/assets returned 404: gone"), "p": 2})
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0] == "4 albums (1 could not be counted: GET albums/b/assets returned 404: gone)"
+    assert out[1:] == ["Travel / Kyoto  (a)  5 photos", "Travel / Osaka  (b)  ? photos", "[folder] Travel  (f)",
+                       "[project] Picks  (p)  2 photos"]
+
+
+def test_changing_a_project_album_forgets_its_count(monkeypatch):
+    monkeypatch.setattr(server.lr, "request", lambda method, path, body=None: (
+        (204, b"") if method == "DELETE" else (201, b'{"resources": [{"id": "x"}]}')))
+    server.lr._count_cache.update({"p": ("u3", 0.0, 3), "q": ("u4", 0.0, 4), "a": ("u1", 0.0, 9)})
+    server.lr_add_to_project_album("p", ["x"])
+    server.lr_delete_project_album("q")
+    assert list(server.lr._count_cache) == ["a"]
+
+
+def serve_album_assets(monkeypatch, sizes):
+    """Serve ALBUMS and one page of album assets per album through the real album_asset_count."""
+    fetched = []
+
+    def get_json(url, auth=True, deadline=None):
+        album_id = url.split("albums/")[1].split("/")[0]
+        fetched.append(album_id)
+        return {"base": "https://lr.adobe.io/v2/catalogs/c/", "resources": [{}] * sizes[album_id]}
+
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(ALBUMS))
+    monkeypatch.setattr(server.lr, "get_json", get_json)
+    return fetched
+
+
+def test_list_albums_shows_cached_counts_after_the_time_limit(monkeypatch):
+    fetched = serve_album_assets(monkeypatch, {"a": 7, "b": 8, "p": 9})
+    assert "Travel / Kyoto  (a)  7 photos" in server.lr_list_albums(query="kyoto", include_counts=True)
+    monkeypatch.setattr(server, "COUNT_SECONDS", -1)
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("4 albums (2 not counted, time limit reached")
+    assert out[1:3] == ["Travel / Kyoto  (a)  7 photos", "Travel / Osaka  (b)  ? photos"]
+    assert fetched == ["a"]  # nothing new is requested once the time is up
+
+
+def test_list_albums_counts_survive_an_unexpected_error(monkeypatch):
+    count_albums(monkeypatch, {"a": 5, "b": AttributeError("'NoneType' object has no attribute 'get'"), "p": 2})
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0] == """4 albums (1 could not be counted: AttributeError("'NoneType' object has no attribute 'get'"))"""
+    assert out[1:3] == ["Travel / Kyoto  (a)  5 photos", "Travel / Osaka  (b)  ? photos"]
+
+
+def test_list_albums_counts_when_every_album_fails(monkeypatch):
+    err = LrError("GET albums/x/assets returned 429: slow down")
+    count_albums(monkeypatch, {"a": err, "b": err, "p": err})
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0] == "4 albums (3 could not be counted: GET albums/x/assets returned 429: slow down)"
+    assert sum("? photos" in line for line in out) == 3
+
+
+def test_list_albums_with_counts_fails_clearly_when_not_signed_in(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 5, "b": 5, "p": 5})
+
+    def not_signed_in():
+        raise LrError("Not signed in. Run lr_login (or `lr-mcp login`) first.")
+
+    monkeypatch.setattr(server.lr, "access_token", not_signed_in)
+    with pytest.raises(LrError, match="Not signed in"):
+        server.lr_list_albums(include_counts=True)
+    assert calls == []
+
+
+def test_a_failed_add_still_forgets_the_album_count(monkeypatch):
+    replies = iter([(201, b'{"resources": [{"id": "x"}]}'), (500, b'{"code": 1}')])
+    monkeypatch.setattr(server.lr, "request", lambda method, path, body=None: next(replies))
+    server.lr._count_cache["p"] = ("u3", 0.0, 3)
+    with pytest.raises(LrError, match="500"):
+        server.lr_add_to_project_album("p", [f"id{i}" for i in range(60)])
+    assert "p" not in server.lr._count_cache
+
+
+def test_list_albums_reports_a_request_cut_off_by_the_time_limit_as_not_counted(monkeypatch):
+    def count(album_id, updated=None, deadline=None):
+        if album_id == "b":
+            monkeypatch.setattr(server.time, "monotonic", lambda: deadline + 1)
+            raise LrError("GET albums/b/assets failed after 1 attempt: TimeoutError()")
+        return 5
+
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter([a for a in ALBUMS if a["id"] in "fb"]))
+    monkeypatch.setattr(server.lr, "album_asset_count", count)
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("2 albums (1 not counted, time limit reached") and "could not" not in out[0]
+    assert out[1] == "Travel / Osaka  (b)  ? photos"
