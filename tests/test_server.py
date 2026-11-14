@@ -1,5 +1,4 @@
 import json
-import threading
 import time
 from types import SimpleNamespace
 
@@ -34,6 +33,7 @@ def catalog(monkeypatch):
     server._albums_cache = (0.0, None)
     server._album_cache.clear()
     server.lr._count_cache.clear()
+    server.lr._count_gen.clear()
     monkeypatch.setattr(server.lr, "access_token", lambda: "token")
     monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {}})
 
@@ -675,7 +675,7 @@ def serve_album_assets(monkeypatch, sizes):
     """Serve ALBUMS and one page of album assets per album through the real album_asset_count."""
     fetched = []
 
-    def get_json(url, auth=True):
+    def get_json(url, auth=True, deadline=None):
         album_id = url.split("albums/")[1].split("/")[0]
         fetched.append(album_id)
         return {"base": "https://lr.adobe.io/v2/catalogs/c/", "resources": [{}] * sizes[album_id]}
@@ -693,28 +693,6 @@ def test_list_albums_shows_cached_counts_after_the_time_limit(monkeypatch):
     assert out[0].startswith("4 albums (2 not counted, time limit reached")
     assert out[1:3] == ["Travel / Kyoto  (a)  7 photos", "Travel / Osaka  (b)  ? photos"]
     assert fetched == ["a"]  # nothing new is requested once the time is up
-
-
-def test_list_albums_does_not_wait_for_a_stuck_count(monkeypatch):
-    release = threading.Event()
-
-    def count(album_id, updated=None, deadline=None):
-        if album_id == "b":
-            release.wait(30)
-        return 5
-
-    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(ALBUMS))
-    monkeypatch.setattr(server.lr, "album_asset_count", count)
-    monkeypatch.setattr(server, "COUNT_SECONDS", 0)
-    monkeypatch.setattr(server, "COUNT_GRACE", 0.2)
-    t = time.monotonic()
-    try:
-        out = server.lr_list_albums(include_counts=True).splitlines()
-    finally:
-        release.set()
-    assert time.monotonic() - t < 5
-    assert out[0].startswith("4 albums (1 not counted, time limit reached")
-    assert out[1:3] == ["Travel / Kyoto  (a)  5 photos", "Travel / Osaka  (b)  ? photos"]
 
 
 def test_list_albums_counts_survive_an_unexpected_error(monkeypatch):

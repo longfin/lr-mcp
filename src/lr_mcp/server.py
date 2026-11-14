@@ -15,7 +15,7 @@ import re
 import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,8 +40,7 @@ mcp = MCPServer(
 _albums_cache = (0.0, None)
 MAX_SCAN = 20000   # assets lr_list_photos looks at before giving up
 SCAN_SECONDS = 60  # ...or the time it spends, leaving room for one slow page; clients time out at ~120 s
-COUNT_SECONDS = 60  # time lr_list_albums spends starting photo counts, for the same reason...
-COUNT_GRACE = 15    # ...and how much longer it waits for requests already under way
+COUNT_SECONDS = 60  # time lr_list_albums spends counting photos, for the same reason
 
 
 def _albums():
@@ -262,13 +261,9 @@ def _album_counts(albums):
         except Exception as e:  # one bad album or response must not lose the whole listing
             return e
 
-    # No `with`: leaving it would wait for every worker, and a request that is retrying or stalled
-    # can outlast the client's timeout. Stragglers finish in the background and still fill the cache.
-    ex = ThreadPoolExecutor(6)
-    futures = [ex.submit(count, a) for a in albums]
-    done, _ = wait(futures, timeout=max(COUNT_SECONDS, 0) + COUNT_GRACE)
-    results = [f.result() if f in done else None for f in futures]
-    ex.shutdown(wait=False, cancel_futures=True)
+    # every worker is back soon after the deadline: requests stop retrying and waiting at it
+    with ThreadPoolExecutor(6) as ex:
+        results = list(ex.map(count, albums))
     counts = {a["id"]: r for a, r in zip(albums, results) if isinstance(r, int)}
     late = sum(r is None for r in results)
     errors = [r for r in results if isinstance(r, Exception)]
@@ -290,7 +285,9 @@ def lr_list_albums(query: str | None = None, include_folders: bool = True, inclu
     include_counts: append each album's photo count (videos included), e.g. '... (id)  112 photos'.
     Folders get no count. This costs a request per album, so pass a query when you can. Counting
     stops after 60 s; the first line then says how many albums are left, they are listed with
-    '? photos', and calling again continues from there. Counts are cached for up to 10 minutes."""
+    '? photos', and calling again continues from there (an album of tens of thousands of photos
+    may never finish in that time). An album whose count failed is also listed with '? photos'
+    and the first line quotes the error. Counts are cached for up to 10 minutes."""
     paths = _album_paths()
     rows = []
     for a in _albums():

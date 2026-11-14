@@ -27,7 +27,7 @@ def test_paginate_follows_relative_next_links(monkeypatch):
             "resources": [3],
         },
     }
-    monkeypatch.setattr(lr, "get_json", lambda url, auth=True: pages[url])
+    monkeypatch.setattr(lr, "get_json", lambda url, auth=True, deadline=None: pages[url])
     assert list(lr.paginate("/v2/catalogs/c/assets?limit=2")) == [1, 2, 3]
 
 
@@ -394,13 +394,18 @@ def test_get_fails_fast_on_dns_error(monkeypatch):
     assert slept == []
 
 
+deadlines = []  # the deadline each page request of album_pages was given
+
+
 def album_pages(monkeypatch, sizes):
     """Serve album `a` as pages of the given sizes; returns the list of fetched URLs."""
     base = lr.LR + "/v2/catalogs/c/"
     fetched = []
+    deadlines.clear()
 
-    def get_json(url, auth=True):
+    def get_json(url, auth=True, deadline=None):
         fetched.append(url)
+        deadlines.append(deadline)
         i = int(url.partition("&page=")[2] or 0)
         page = {"base": base, "resources": [{"id": f"{i}-{k}"} for k in range(sizes[i])]}
         if i + 1 < len(sizes):
@@ -410,6 +415,7 @@ def album_pages(monkeypatch, sizes):
     monkeypatch.setattr(lr, "catalog_path", lambda: "/v2/catalogs/c/")
     monkeypatch.setattr(lr, "get_json", get_json)
     monkeypatch.setattr(lr, "_count_cache", {})
+    monkeypatch.setattr(lr, "_count_gen", {})
     return fetched
 
 
@@ -457,6 +463,7 @@ def test_album_asset_count_gives_up_at_deadline_with_pages_left(monkeypatch):
     slow_pages(monkeypatch, fetched)
     assert lr.album_asset_count("a", "u", deadline=5) is None
     assert len(fetched) == 1
+    assert deadlines == [5]  # the requests are held to the deadline too
     assert lr._count_cache == {}  # a partial count must not be cached
     assert lr.album_asset_count("a", "u") == 1037
 
@@ -482,3 +489,88 @@ def test_album_asset_count_past_the_deadline_still_answers_from_the_cache(monkey
     assert lr.album_asset_count("a", "u", deadline=time.monotonic() - 1) == 37
     assert lr.album_asset_count("a", "changed", deadline=time.monotonic() - 1) is None
     assert len(fetched) == 1  # no request is started past the deadline
+
+
+def test_album_changed_while_being_counted_is_not_cached(monkeypatch):
+    fetched = album_pages(monkeypatch, [3])
+    get_json = lr.get_json
+
+    def changed_meanwhile(url, auth=True, deadline=None):
+        lr.forget_album_count("a")  # e.g. lr_add_to_project_album finishing in another thread
+        return get_json(url, auth, deadline)
+
+    monkeypatch.setattr(lr, "get_json", changed_meanwhile)
+    assert lr.album_asset_count("a", "u") == 3  # the caller still gets what was counted
+    assert "a" not in lr._count_cache
+    monkeypatch.setattr(lr, "get_json", get_json)
+    assert lr.album_asset_count("a", "u") == 3
+    assert len(fetched) == 2 and "a" in lr._count_cache
+
+
+def _clock(monkeypatch, start=100.0):
+    """A fake clock that only time.sleep moves; returns the list of sleeps."""
+    now, slept = [start], []
+
+    def sleep(s):
+        slept.append(s)
+        now[0] += s
+
+    monkeypatch.setattr(lr.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(lr.time, "sleep", sleep)
+    return slept
+
+
+def test_get_does_not_retry_past_deadline(monkeypatch):
+    _client(monkeypatch)
+    slept, timeouts = _clock(monkeypatch), []
+
+    def urlopen(req, timeout=None):
+        timeouts.append(timeout)
+        raise lr.http.client.RemoteDisconnected("closed")
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    with pytest.raises(lr.LrError, match="failed after 3 attempts"):
+        lr.request("GET", "/v2/account", deadline=105)  # 5 s left: room for the 1 s and 3 s waits, not the 5 s one
+    assert slept == [1, 3]
+    assert timeouts == [5, 4, 1]  # each attempt waits no longer than the time left
+
+
+def test_get_past_deadline_gets_one_short_attempt(monkeypatch):
+    _client(monkeypatch)
+    slept, timeouts = _clock(monkeypatch), []
+
+    def urlopen(req, timeout=None):
+        timeouts.append(timeout)
+        raise lr.http.client.RemoteDisconnected("closed")
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    with pytest.raises(lr.LrError, match="failed after 1 attempt:"):
+        lr.request("GET", "/v2/account", deadline=50)
+    assert slept == [] and timeouts == [1]
+
+
+def test_get_returns_retryable_status_instead_of_waiting_past_deadline(monkeypatch):
+    _client(monkeypatch)
+    slept, calls = _clock(monkeypatch), []
+
+    def urlopen(req, timeout=None):
+        calls.append(1)
+        raise _make_http_error(429, {"Retry-After": "10"})
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    assert lr.request("GET", "/v2/account", deadline=105) == (429, b"err")
+    assert slept == [] and calls == [1]
+
+
+def test_get_without_deadline_is_unchanged_by_a_far_deadline(monkeypatch):
+    _client(monkeypatch)
+    slept, timeouts = _clock(monkeypatch), []
+
+    def urlopen(req, timeout=None):
+        timeouts.append(timeout)
+        raise lr.http.client.RemoteDisconnected("closed")
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    with pytest.raises(lr.LrError, match="failed after 6 attempts"):
+        lr.request("GET", "/v2/account", deadline=100 + 3600)
+    assert slept == [1, 3, 5, 7, 9] and timeouts == [lr.REQUEST_TIMEOUT] * 6
