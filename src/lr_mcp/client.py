@@ -49,7 +49,9 @@ LR = "https://lr.adobe.io"
 
 
 class LrError(ToolError):
-    """Subclasses ToolError so the message reaches the model instead of a generic error."""
+    """Subclasses ToolError so the message reaches the model instead of a generic error.
+    retryable: True when trying the same call again later may succeed (see rendition)."""
+    retryable = False
 
 
 def parse_env(text):
@@ -309,10 +311,13 @@ def _transient_status(status):
     return status in RETRY_STATUSES or status >= 500
 
 
-def _error(message, retryable):
-    """An LrError whose `retryable` says whether trying the same call again later may succeed."""
+def _error(message, retryable, status=None):
+    """An LrError whose `retryable` says whether trying the same call again later may succeed;
+    `status` is the HTTP status when the error comes from a response."""
     e = LrError(message)
     e.retryable = retryable
+    if status is not None:
+        e.status = status
     return e
 
 
@@ -354,8 +359,9 @@ def request(method, path, body=None, content_type="application/json", auth=True,
         except (http.client.HTTPException, urllib.error.URLError, OSError) as e:
             delay = None if last or _permanent(e) else _backoff(attempt)
             if delay is None or _too_late(deadline, delay):
+                # a GET has had its retries here already; a write had one attempt
                 raise _error(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}",
-                             not _permanent(e)) from e
+                             method != "GET" and not _permanent(e)) from e
         time.sleep(delay)
 
 
@@ -453,8 +459,9 @@ def forget_album_count(album_id):
 def rendition(asset_id, kind):
     """kind: thumbnail2x | 640 | 1280 | 2048 | 2560 | fullsize.
     2560 and fullsize are generated on demand and polled until ready.
-    Failures raise LrError with `retryable` True when a later try may succeed: a rendition still
-    being generated after the polling, a 429 or 5xx status, or a dropped connection."""
+    Failures raise LrError with `retryable` True only for what request() has not already retried:
+    a rendition still being generated after the polling, or a generation request (one attempt)
+    that got a 429 or 5xx status or a dropped connection."""
     path = catalog_path() + f"assets/{asset_id}/renditions/{kind}"
     status, body = request("GET", path)
     generating = False
@@ -463,7 +470,7 @@ def rendition(asset_id, kind):
                          body=b"", content_type="application/octet-stream",
                          headers={"X-Generate-Renditions": kind})
         if gs != 202:
-            raise _error(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}", _transient_status(gs))
+            raise _error(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}", _transient_status(gs), gs)
         generating = True
         for _ in range(30):
             time.sleep(2)
@@ -472,5 +479,5 @@ def rendition(asset_id, kind):
                 break
     if status != 200:
         raise _error(f"Rendition {kind} for {asset_id} failed ({status}): {parse(body)}",
-                     _transient_status(status) or (generating and status == 404))
+                     generating and status == 404, status)
     return body

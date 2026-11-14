@@ -8,6 +8,7 @@
 """
 import asyncio
 import contextlib
+import errno
 import itertools
 import json
 import math
@@ -480,8 +481,12 @@ def lr_view_photos(asset_ids: list[str], size: str = "640") -> list:
 
 SIDECAR = ".lr-mcp.json"
 SIDECAR_LOCK = SIDECAR + ".lock"  # held while the sidecar is merged; kept in the folder
-SIDECAR_FLUSH_SECONDS = 2  # saved photos are recorded at least this often, so an interrupted run keeps them
-DOWNLOAD_ATTEMPTS = 3      # tries per photo for failures that may pass (see lr.rendition)
+DOWNLOAD_ATTEMPTS = 2  # tries per photo for failures the client has not retried already (see lr.rendition)
+GIVE_UP_AFTER = 8      # photos failing in a row that end a download early, e.g. during an outage
+STALE_TEMP_SECONDS = 3600  # a temp file of ours this old was left by a killed run
+_TEMP = re.compile(r"\..+\.[0-9a-f]{32}\.tmp")  # _write_atomic's temp file names
+# flock errors meaning the file system has no locks (some NFS, SMB and FUSE mounts)
+_NO_LOCKS = {errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)}
 
 
 def _edited(asset):
@@ -503,7 +508,7 @@ def _read_sidecar(dest):
 def _write_atomic(path, data):
     """Write to a temp file of this writer's own in the same folder, then rename it over `path`, so
     `path` never holds a partial file. The temp file is removed when the write or rename fails."""
-    tmp = path.with_name(f".{path.name.lstrip('.')}.{uuid.uuid4().hex}.tmp")
+    tmp = path.with_name(f".{path.name.lstrip('.')}.{uuid.uuid4().hex}.tmp")  # matches _TEMP
     try:
         with open(tmp, "xb") as f:
             f.write(data)
@@ -521,16 +526,36 @@ def _write_sidecar(dest, entries):
         return f"could not write {SIDECAR} ({e}); the next call will download these again"
 
 
+def _open_lock(dest):
+    """The lock file, created if needed; read-only when it exists but cannot be written (flock
+    does not need write access)."""
+    try:
+        return open(dest / SIDECAR_LOCK, "a+b")
+    except OSError:
+        try:
+            return open(dest / SIDECAR_LOCK, "rb")
+        except OSError:
+            pass
+        raise
+
+
 @contextlib.contextmanager
 def _folder_lock(dest):
     """Exclusive lock on <dest>/.lr-mcp.json.lock, so two processes saving into one folder do not
-    lose each other's sidecar entries."""
-    with open(dest / SIDECAR_LOCK, "a+b") as f:
-        if fcntl:
-            fcntl.flock(f, fcntl.LOCK_EX)
-        else:
-            f.seek(0)
-            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+    lose each other's sidecar entries. On a file system without locks the caller goes ahead unlocked,
+    as before this lock existed."""
+    with _open_lock(dest) as f:
+        try:
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_EX)
+            else:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError as e:
+            if e.errno not in _NO_LOCKS:
+                raise
+            yield
+            return
         try:
             yield
         finally:
@@ -541,20 +566,35 @@ def _folder_lock(dest):
                 msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _remove_stale_temps(dest):
+    """Delete temp files that _write_atomic left behind when a run was killed: only names of that
+    exact shape, and only when older than STALE_TEMP_SECONDS, so a running call's are kept."""
+    cutoff = time.time() - STALE_TEMP_SECONDS
+    try:
+        for p in dest.iterdir():
+            try:
+                if _TEMP.fullmatch(p.name) and p.is_file() and not p.is_symlink() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 class _Sidecar:
-    """Entries of photos saved by one call, merged into <dest>/.lr-mcp.json while the downloads run
-    (at most every SIDECAR_FLUSH_SECONDS) and once at the end. Each merge re-reads the file under
-    the folder lock, so entries written meanwhile by another call are kept."""
+    """Entries of photos saved by one call, merged into <dest>/.lr-mcp.json as each photo is saved.
+    Each merge re-reads the file under the folder lock, so entries written meanwhile by another call
+    are kept. A failed merge keeps its entries for the next one, and flush() merges once more at
+    the end of the call, also when it is interrupted."""
 
     def __init__(self, dest):
-        self.dest, self.pending, self.last = dest, {}, time.monotonic()
+        self.dest, self.pending = dest, {}
         self.lock = threading.Lock()
 
     def add(self, name, entry):
         with self.lock:
             self.pending[name] = entry
-            if time.monotonic() - self.last >= SIDECAR_FLUSH_SECONDS:
-                self._flush()  # a failure here is retried at the next flush
+            self._flush()  # a failure here is retried at the next merge
 
     def flush(self):
         """Merge what is pending; returns an error string or None."""
@@ -562,7 +602,6 @@ class _Sidecar:
             return self._flush()
 
     def _flush(self):
-        self.last = time.monotonic()
         if not self.pending:
             return None
         try:
@@ -575,14 +614,14 @@ class _Sidecar:
         return error
 
 
-def _rendition(asset_id, size):
+def _rendition(asset_id, size, may_retry=lambda: True):
     """lr.rendition, tried up to DOWNLOAD_ATTEMPTS times with backoff when the failure is retryable
-    (a rendition still being generated, a 429/5xx status, a dropped connection)."""
+    (see lr.rendition: only what the client has not retried itself) and may_retry() allows it."""
     for attempt in range(DOWNLOAD_ATTEMPTS):
         try:
             return lr.rendition(asset_id, size)
         except LrError as e:
-            if attempt + 1 == DOWNLOAD_ATTEMPTS or not getattr(e, "retryable", False):
+            if attempt + 1 == DOWNLOAD_ATTEMPTS or not e.retryable or not may_retry():
                 raise
         time.sleep(lr._backoff(attempt))
 
@@ -602,13 +641,16 @@ def lr_download_photos(
     naming: 'file' (default) names files after the original file name with a .jpg extension
     (IMG_1.jpg, then IMG_1-2.jpg for a second photo with that name); 'id' names them <asset id>.jpg,
     which stays the same when a photo is renamed.
-    <dest_dir>/.lr-mcp.json records what was saved, updated while the downloads run, so an
-    interrupted call keeps its progress; on the next call into the same folder, photos whose file,
-    size and edit time are unchanged are skipped. This needs a stable folder: album_id or an
-    explicit dest_dir (asset_ids alone get a new export-<timestamp> folder each time).
+    Switching naming in one folder keeps both copies; each name has its own cache entry.
+    <dest_dir>/.lr-mcp.json records each photo as soon as it is saved, so an interrupted call keeps
+    its progress; on the next call into the same folder, photos whose file, size and edit time are
+    unchanged are skipped. This needs a stable folder: album_id or an explicit dest_dir (asset_ids
+    alone get a new export-<timestamp> folder each time). A .lr-mcp.json.lock file stays next to it.
     force=True re-downloads everything, e.g. if a saved file looks stale.
-    Each file is written under a temporary name and renamed when complete. A photo whose rendition
-    fails for a reason that may pass (still being generated, server busy) is tried up to 3 times."""
+    Each file is written under a temporary name and renamed when complete, so the folder must be
+    writable (in a read-only one every photo fails). A rendition still being generated after a
+    minute, or a failed generation request, gets one more try. After 8 photos fail in a row the
+    rest are not tried, and the reply says how many; call again to continue."""
     if size not in ("640", "1280", "2048", "2560", "fullsize"):
         raise LrError("size must be one of 640, 1280, 2048, 2560, fullsize")
     if naming not in ("file", "id"):
@@ -626,6 +668,7 @@ def lr_download_photos(
         raise LrError("Pass asset_ids or album_id.")
     dest = Path(dest_dir).expanduser() if dest_dir else Path.home() / "Downloads" / "lightroom" / re.sub(r'[/:]', "_", name)
     dest.mkdir(parents=True, exist_ok=True)
+    _remove_stale_temps(dest)
 
     used = set()
 
@@ -660,16 +703,25 @@ def lr_download_photos(
             unchanged += 1
         else:
             jobs.append((aid, path, updated))
-    errors, saved, sidecar = [], {}, _Sidecar(dest)
+    errors, saved, sidecar, not_tried = [], {}, _Sidecar(dest), []
+    streak, streak_lock = [0], threading.Lock()  # photos failed in a row
 
     def fetch(job):
         aid, path, updated = job
+        with streak_lock:
+            if streak[0] >= GIVE_UP_AFTER:
+                not_tried.append(aid)
+                return
         try:
-            data = _rendition(aid, size)
+            data = _rendition(aid, size, lambda: streak[0] < GIVE_UP_AFTER)
             _write_atomic(path, data)
         except (LrError, OSError) as e:
+            with streak_lock:
+                streak[0] += 1
             errors.append(f"{aid}: {e}")
             return
+        with streak_lock:
+            streak[0] = 0
         saved[path.name] = {"asset_id": aid, "size": size, "updated": updated, "bytes": len(data)}
         sidecar.add(path.name, saved[path.name])
 
@@ -686,6 +738,9 @@ def lr_download_photos(
         msg += f"\nSkipped {skipped} non-image assets (videos etc.)"
     if errors:
         msg += f"\n{len(errors)} failed:\n" + "\n".join(errors[:20])
+    if not_tried:
+        msg += (f"\n{len(not_tried)} more not tried: {GIVE_UP_AFTER} photos failed in a row, so the download "
+                "stopped early; call again to fetch them")
     if warning:
         msg += f"\nWarning: {warning}"
     return msg
