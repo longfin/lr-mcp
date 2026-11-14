@@ -584,3 +584,73 @@ def test_get_without_deadline_is_unchanged_by_a_far_deadline(monkeypatch):
     with pytest.raises(lr.LrError, match="failed after 6 attempts"):
         lr.request("GET", "/v2/account", deadline=100 + 3600)
     assert slept == [1, 3, 5, 7, 9] and timeouts == [lr.REQUEST_TIMEOUT] * 6
+
+
+def _renditions(monkeypatch, replies):
+    """Answer request() from `replies` (method -> list of (status, body)); returns the calls made."""
+    calls = []
+
+    def request(method, path, **kw):
+        calls.append(method)
+        return replies[method].pop(0) if len(replies[method]) > 1 else replies[method][0]
+
+    monkeypatch.setattr(lr, "catalog_path", lambda: "/v2/catalogs/c/")
+    monkeypatch.setattr(lr, "request", request)
+    monkeypatch.setattr(lr.time, "sleep", lambda s: None)
+    return calls
+
+
+@pytest.mark.parametrize("kind, replies, retryable", [
+    ("2048", {"GET": [(404, b'{"code": 1002}')]}, False),               # no such asset
+    ("2048", {"GET": [(403, b"")]}, False),
+    ("2048", {"GET": [(503, b"")]}, False),   # request() has retried a GET already
+    ("2048", {"GET": [(500, b"")]}, False),
+    ("fullsize", {"GET": [(404, b"")], "POST": [(202, b"")]}, True),     # still generating after the polling
+    ("fullsize", {"GET": [(404, b"")], "POST": [(403, b"")]}, False),
+    ("fullsize", {"GET": [(404, b"")], "POST": [(429, b"")]}, True),     # the POST had one attempt
+    ("fullsize", {"GET": [(404, b"")], "POST": [(503, b"")]}, True),
+])
+def test_rendition_errors_say_whether_to_retry(monkeypatch, kind, replies, retryable):
+    _renditions(monkeypatch, replies)
+    with pytest.raises(lr.LrError) as e:
+        lr.rendition("a1", kind)
+    assert e.value.retryable is retryable
+
+
+@pytest.mark.parametrize("replies, status", [({"GET": [(503, b"")]}, 503),
+                                             ({"GET": [(404, b"")], "POST": [(403, b"")]}, 403),
+                                             ({"GET": [(404, b"")], "POST": [(202, b"")]}, 404)])
+def test_rendition_errors_carry_the_status(monkeypatch, replies, status):
+    _renditions(monkeypatch, replies)
+    with pytest.raises(lr.LrError) as e:
+        lr.rendition("a1", "fullsize")
+    assert e.value.status == status
+
+
+def test_lr_error_is_not_retryable_by_default():
+    assert lr.LrError("x").retryable is False
+
+
+def test_rendition_polls_until_generated(monkeypatch):
+    calls = _renditions(monkeypatch, {"GET": [(404, b""), (404, b""), (200, b"jpeg")], "POST": [(202, b"")]})
+    assert lr.rendition("a1", "2560") == b"jpeg"
+    assert calls == ["GET", "POST", "GET", "GET"]
+
+
+def test_network_failures_say_whether_to_retry(monkeypatch):
+    _client(monkeypatch)
+
+    def fail_with(exc):
+        monkeypatch.setattr(lr.urllib.request, "urlopen", lambda req, timeout=None: (_ for _ in ()).throw(exc))
+
+    fail_with(ConnectionResetError("reset"))
+    with pytest.raises(lr.LrError) as e:
+        lr.request("GET", "/v2/account")
+    assert e.value.retryable is False  # request() has retried the GET to exhaustion already
+    with pytest.raises(lr.LrError) as e:
+        lr.request("POST", "/v2/x", body=b"")
+    assert e.value.retryable is True   # a write gets one attempt here
+    fail_with(lr.urllib.error.URLError(lr.socket.gaierror(8, "nodename nor servname provided")))
+    with pytest.raises(lr.LrError) as e:
+        lr.request("POST", "/v2/x", body=b"")
+    assert e.value.retryable is False

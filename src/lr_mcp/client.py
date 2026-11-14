@@ -50,14 +50,18 @@ LR = "https://lr.adobe.io"
 
 class LrError(ToolError):
     """Subclasses ToolError so the message reaches the model instead of a generic error.
-    status: the HTTP status when the error comes from an HTTP response, else None."""
+    status: the HTTP status when the error comes from an HTTP response, else None.
+    retryable: True when trying the same call again later may succeed (see rendition)."""
     status = None
+    retryable = False
 
 
-def _http_error(message, status):
-    """An LrError for an HTTP response with this status."""
+def _http_error(message, status, retryable=False):
+    """An LrError with the HTTP status of the response it comes from (None for a failure without
+    a response) and whether trying the same call again later may succeed."""
     e = LrError(message)
     e.status = status
+    e.retryable = retryable
     return e
 
 
@@ -314,6 +318,10 @@ def _retry_after(headers, attempt):
     return min(int(v), 10) if v.isascii() and v.isdigit() else _backoff(attempt)
 
 
+def _transient_status(status):
+    return status in RETRY_STATUSES or status >= 500
+
+
 def _too_late(deadline, delay):
     return deadline is not None and time.monotonic() + delay > deadline
 
@@ -352,7 +360,9 @@ def request(method, path, body=None, content_type="application/json", auth=True,
         except (http.client.HTTPException, urllib.error.URLError, OSError) as e:
             delay = None if last or _permanent(e) else _backoff(attempt)
             if delay is None or _too_late(deadline, delay):
-                raise LrError(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}") from e
+                # a GET has had its retries here already; a write had one attempt
+                raise _http_error(f"{method} {url} failed after {attempt + 1} attempt{'s' if attempt else ''}: {e!r}",
+                                  None, method != "GET" and not _permanent(e)) from e
         time.sleep(delay)
 
 
@@ -449,20 +459,26 @@ def forget_album_count(album_id):
 
 def rendition(asset_id, kind):
     """kind: thumbnail2x | 640 | 1280 | 2048 | 2560 | fullsize.
-    2560 and fullsize are generated on demand and polled until ready."""
+    2560 and fullsize are generated on demand and polled until ready.
+    Failures raise LrError with `retryable` True only for what request() has not already retried:
+    a rendition still being generated after the polling, or a generation request (one attempt)
+    that got a 429 or 5xx status or a dropped connection."""
     path = catalog_path() + f"assets/{asset_id}/renditions/{kind}"
     status, body = request("GET", path)
+    generating = False
     if status == 404 and kind in ("2560", "fullsize"):
         gs, gb = request("POST", catalog_path() + f"assets/{asset_id}/renditions",
                          body=b"", content_type="application/octet-stream",
                          headers={"X-Generate-Renditions": kind})
         if gs != 202:
-            raise _http_error(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}", gs)
+            raise _http_error(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}", gs, _transient_status(gs))
+        generating = True
         for _ in range(30):
             time.sleep(2)
             status, body = request("GET", path)
             if status == 200:
                 break
     if status != 200:
-        raise _http_error(f"Rendition {kind} for {asset_id} failed ({status}): {parse(body)}", status)
+        raise _http_error(f"Rendition {kind} for {asset_id} failed ({status}): {parse(body)}", status,
+                          generating and status == 404)
     return body

@@ -1,5 +1,12 @@
+import errno
 import json
+import os
+import subprocess
+import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -575,10 +582,523 @@ def test_download_os_error_is_reported_and_others_recorded(tmp_path, lib, monkey
 
 
 def test_download_sidecar_write_failure_is_a_warning(tmp_path, lib, monkeypatch):
-    monkeypatch.setattr(server.os, "replace", lambda a, b: (_ for _ in ()).throw(OSError(13, "denied")))
+    replace = server.os.replace
+
+    def deny_sidecar(a, b):
+        if Path(b).name == server.SIDECAR:
+            raise OSError(13, "denied")
+        replace(a, b)
+
+    monkeypatch.setattr(server.os, "replace", deny_sidecar)
     out = server.lr_download_photos(asset_ids=["a1", "a2"], size="2560", dest_dir=str(tmp_path))
     assert out.startswith("Saved 2 photos") and "Warning: could not write .lr-mcp.json" in out
     assert not list(tmp_path.glob("*.tmp")) and not (tmp_path / server.SIDECAR).exists()
+
+
+class Killed(BaseException):
+    """Stands in for the process being stopped in the middle of a download."""
+
+
+def _one_worker(monkeypatch):
+    monkeypatch.setattr(server, "ThreadPoolExecutor", lambda n: ThreadPoolExecutor(1))
+
+
+def _photos(monkeypatch, n):
+    """n photos IMG_0.jpg ... IMG_<n-1>.jpg served to lr_download_photos(asset_ids=...)."""
+    items = [asset(f"p{i}", "2024-05-01T12:00:00", file=f"IMG_{i}.ARW") for i in range(n)]
+    for a in items:
+        a["payload"]["develop"] = {"userUpdated": "2024-06-01T00:00:00Z"}
+    monkeypatch.setattr(server.lr, "get_json", lambda path: {"resources": items})
+    return [a["id"] for a in items]
+
+
+def test_hard_kill_keeps_every_photo_saved_so_far(tmp_path, monkeypatch):
+    """5 photos finish at once while 3 slow ones are still downloading; a kill at that moment
+    must find all 5 in the sidecar."""
+    ids = _photos(monkeypatch, 8)
+    slow, release, five_added = set(ids[5:]), threading.Event(), threading.Event()
+
+    def rendition(aid, size):
+        if aid in slow:
+            assert release.wait(10)
+        return aid.encode()
+
+    real_add, added = server._Sidecar.add, []
+
+    def add(self, name, entry):
+        real_add(self, name, entry)
+        added.append(name)
+        if len(added) == 5:
+            five_added.set()
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    monkeypatch.setattr(server._Sidecar, "add", add)
+    monkeypatch.setattr(server, "ThreadPoolExecutor", lambda n: ThreadPoolExecutor(8))
+    out = []
+    t = threading.Thread(target=lambda: out.append(server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))))
+    t.start()
+    try:
+        assert five_added.wait(10)
+        on_disk = server._read_sidecar(tmp_path)  # what a SIGKILL now would leave
+    finally:
+        release.set()
+        t.join(10)
+    assert set(on_disk) == {f"IMG_{i}.jpg" for i in range(5)}
+    assert out[0].splitlines()[0] == f"Saved 8 photos to {tmp_path}"
+
+
+def test_interrupted_download_keeps_its_progress(lib, tmp_path, monkeypatch):
+    _one_worker(monkeypatch)  # a1 before a2
+    real, seen = server.lr.rendition, {}
+
+    def rendition(aid, size):
+        if aid == "a2":
+            seen.update(server._read_sidecar(tmp_path))  # what a hard kill right now would leave
+            raise Killed
+        return real(aid, size)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    with pytest.raises(Killed):
+        _dl(tmp_path)
+    assert set(seen) == {"IMG.jpg"}
+    assert set(server._read_sidecar(tmp_path)) == {"IMG.jpg"}
+    assert not (tmp_path / "IMG-2.jpg").exists()
+    monkeypatch.setattr(server.lr, "rendition", real)
+    lib.calls.clear()
+    out = _dl(tmp_path)
+    assert lib.calls == ["a2"]
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}; 1 unchanged since the last download, not fetched again"
+
+
+def _failing_merges(monkeypatch, failures):
+    """Make the next `failures` sidecar writes fail; returns the list of write attempts."""
+    real, attempts = server._write_sidecar, []
+
+    def write(dest, entries):
+        attempts.append(set(entries))
+        if len(attempts) <= failures:
+            return "could not write .lr-mcp.json (disk busy)"
+        return real(dest, entries)
+
+    monkeypatch.setattr(server, "_write_sidecar", write)
+    return attempts
+
+
+def test_final_merge_runs_when_interrupted(lib, tmp_path, monkeypatch):
+    _one_worker(monkeypatch)
+    attempts = _failing_merges(monkeypatch, 1)  # the merge after a1 fails
+    real = server.lr.rendition
+
+    def rendition(aid, size):
+        if aid == "a2":
+            raise Killed
+        return real(aid, size)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    with pytest.raises(Killed):
+        _dl(tmp_path)
+    assert len(attempts) == 2  # the failed one after a1, then the final one in `finally`
+    assert set(server._read_sidecar(tmp_path)) == {"IMG.jpg"}
+
+
+def test_failed_merge_keeps_its_entries_for_the_next(lib, tmp_path, monkeypatch):
+    _one_worker(monkeypatch)
+    attempts = _failing_merges(monkeypatch, 1)
+    out = _dl(tmp_path)
+    assert attempts[:2] == [{"IMG.jpg"}, {"IMG.jpg", "IMG-2.jpg"}]
+    assert "Warning" not in out and set(server._read_sidecar(tmp_path)) == {"IMG.jpg", "IMG-2.jpg"}
+
+
+def test_lock_failure_while_saving_does_not_fail_the_call(lib, tmp_path, monkeypatch):
+    _one_worker(monkeypatch)
+    real, calls = server._folder_lock, []
+
+    def folder_lock(dest):
+        calls.append(1)
+        if len(calls) == 1:
+            raise PermissionError(13, "denied")
+        return real(dest)
+
+    monkeypatch.setattr(server, "_folder_lock", folder_lock)
+    out = _dl(tmp_path)
+    assert out.splitlines()[0] == f"Saved 2 photos to {tmp_path}" and "Warning" not in out
+    assert set(server._read_sidecar(tmp_path)) == {"IMG.jpg", "IMG-2.jpg"}
+
+
+@pytest.mark.skipif(server.fcntl is None, reason="flock only")
+@pytest.mark.parametrize("err", [errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS])
+def test_sidecar_is_written_where_the_file_system_has_no_locks(lib, tmp_path, monkeypatch, err):
+    def flock(f, op):
+        raise OSError(err, "no locks")
+
+    monkeypatch.setattr(server.fcntl, "flock", flock)
+    out = _dl(tmp_path)
+    assert "Warning" not in out and set(server._read_sidecar(tmp_path)) == {"IMG.jpg", "IMG-2.jpg"}
+
+
+@pytest.mark.skipif(server.fcntl is None, reason="flock only")
+def test_other_lock_errors_are_a_warning(lib, tmp_path, monkeypatch):
+    monkeypatch.setattr(server.fcntl, "flock", lambda f, op: (_ for _ in ()).throw(OSError(errno.EIO, "I/O error")))
+    out = _dl(tmp_path)
+    assert out.startswith("Saved 2 photos") and "Warning: could not write .lr-mcp.json" in out
+
+
+def test_read_only_lock_file_is_still_used(lib, tmp_path, monkeypatch):
+    (tmp_path / server.SIDECAR_LOCK).touch()
+    real_open, modes = open, []
+
+    def open_(path, mode="r", *a, **k):
+        if Path(path).name == server.SIDECAR_LOCK:
+            modes.append(mode)
+            if mode != "rb":
+                raise PermissionError(13, "Permission denied")
+        return real_open(path, mode, *a, **k)
+
+    monkeypatch.setattr(server, "open", open_, raising=False)
+    out = _dl(tmp_path)
+    assert "Warning" not in out and set(server._read_sidecar(tmp_path)) == {"IMG.jpg", "IMG-2.jpg"}
+    assert "rb" in modes
+
+
+def test_stale_temp_files_of_ours_are_removed(lib, tmp_path):
+    hexa, hexb = "a" * 32, "0123456789abcdef" * 2
+    names = {
+        f".IMG.jpg.{hexa}.tmp": True,         # ours, old: removed
+        f".lr-mcp.json.{hexb}.tmp": True,     # the sidecar's, old: removed
+        f".IMG.jpg.{hexb}.tmp": False,        # ours, but recent: maybe a running call's
+        ".IMG.jpg.notahexname.tmp": False,    # other shapes are never touched
+        f"IMG.jpg.{hexa}.tmp": False,
+        f".IMG.jpg.{hexa}.tmp.bak": False,
+        f".OTHER.jpg.{'A' * 32}.tmp": False,  # upper-case hex is not ours
+    }
+    old = time.time() - server.STALE_TEMP_SECONDS - 60
+    for name, stale in names.items():
+        (tmp_path / name).write_bytes(b"x")
+        if stale or name != f".IMG.jpg.{hexb}.tmp":
+            os.utime(tmp_path / name, (old, old))
+    (tmp_path / f".dir.{hexa}.tmp").mkdir()  # a directory of that shape stays too
+    os.utime(tmp_path / f".dir.{hexa}.tmp", (old, old))
+    _dl(tmp_path)
+    left = {p.name for p in tmp_path.iterdir()}
+    assert left == {n for n, gone in names.items() if not gone} | {
+        f".dir.{hexa}.tmp", "IMG.jpg", "IMG-2.jpg", server.SIDECAR, server.SIDECAR_LOCK}
+
+
+class _HalfWrite:
+    """A file whose write stores half the data and then fails, like a full disk."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+    def write(self, data):
+        self.f.write(data[:len(data) // 2])
+        self.f.flush()
+        raise OSError(28, "No space left on device")
+
+
+def test_failed_write_leaves_no_partial_file(lib, tmp_path, monkeypatch):
+    (tmp_path / "IMG.jpg").write_bytes(b"previous version")
+    real_open = open
+
+    def failing_open(path, mode="r", *a, **k):
+        f = real_open(path, mode, *a, **k)
+        return _HalfWrite(f) if Path(path).name.startswith(".IMG.jpg.") else f
+
+    monkeypatch.setattr(server, "open", failing_open, raising=False)
+    out = _dl(tmp_path)
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}"
+    assert "a1: [Errno 28] No space left on device" in out
+    assert (tmp_path / "IMG.jpg").read_bytes() == b"previous version"  # never truncated in place
+    assert (tmp_path / "IMG-2.jpg").read_bytes() == b"a2-2048"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".lr-mcp.json", ".lr-mcp.json.lock", "IMG-2.jpg", "IMG.jpg"]
+    assert set(server._read_sidecar(tmp_path)) == {"IMG-2.jpg"}
+
+
+def test_failed_rename_leaves_no_temp_file(lib, tmp_path, monkeypatch):
+    replace = server.os.replace
+
+    def deny_jpeg(a, b):
+        if Path(b).suffix == ".jpg":
+            raise OSError(13, "denied")
+        replace(a, b)
+
+    monkeypatch.setattr(server.os, "replace", deny_jpeg)
+    out = _dl(tmp_path)
+    assert out.splitlines()[0] == f"Saved 0 photos to {tmp_path}" and "2 failed" in out
+    assert sorted(p.name for p in tmp_path.iterdir()) == []  # nothing saved, so no sidecar or lock either
+
+
+def _retryable(retryable):
+    e = LrError("Rendition fullsize for a1 failed (404): not ready")
+    e.retryable = retryable
+    return e
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    slept = []
+    monkeypatch.setattr(server.time, "sleep", slept.append)
+    monkeypatch.setattr(server.lr.random, "uniform", lambda a, b: 1.0)  # no jitter
+    return slept
+
+
+def test_download_retries_a_rendition_not_ready_once(lib, tmp_path, monkeypatch, sleeps):
+    real, failures = server.lr.rendition, iter([_retryable(True)])
+
+    def rendition(aid, size):
+        if aid == "a1":
+            e = next(failures, None)
+            if e:
+                lib.calls.append(aid)
+                raise e
+        return real(aid, size)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = _dl(tmp_path, size="fullsize")
+    assert out.splitlines()[0] == f"Saved 2 photos to {tmp_path}" and "failed" not in out
+    assert sorted(lib.calls) == ["a1", "a1", "a2"]
+    assert sleeps == [1]
+
+
+def test_download_gives_up_after_the_last_attempt(lib, tmp_path, monkeypatch, sleeps):
+    real = server.lr.rendition
+
+    def rendition(aid, size):
+        if aid != "a1":
+            return real(aid, size)
+        lib.calls.append(aid)
+        raise _retryable(True)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = _dl(tmp_path, size="fullsize")
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}"
+    assert out.endswith("1 failed:\na1: Rendition fullsize for a1 failed (404): not ready")
+    assert sorted(lib.calls) == ["a1"] * server.DOWNLOAD_ATTEMPTS + ["a2"] and sleeps == [1]
+
+
+def test_download_does_not_retry_a_permanent_failure(lib, tmp_path, monkeypatch, sleeps):
+    def rendition(aid, size):
+        lib.calls.append(aid)
+        e = LrError("Rendition 2048 for a1 failed (503): busy")  # already retried by request()
+        if aid == "a2":
+            e.retryable = False
+        raise e  # a1: the class default, e.g. "Not signed in"
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = _dl(tmp_path)
+    assert "2 failed" in out and sorted(lib.calls) == ["a1", "a2"] and sleeps == []
+
+
+def test_download_stops_after_photos_fail_in_a_row(tmp_path, monkeypatch, sleeps):
+    ids = _photos(monkeypatch, 6)
+    _one_worker(monkeypatch)
+    monkeypatch.setattr(server, "GIVE_UP_AFTER", 2)
+    calls = []
+
+    def rendition(aid, size):
+        calls.append(aid)
+        raise _retryable(True)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, size="fullsize", dest_dir=str(tmp_path))
+    # p0 is retried; p1 too (one failure in a row so far); then the call stops
+    assert calls == ["p0", "p0", "p1", "p1"] and sleeps == [1, 1]
+    assert "\n2 failed:\n" in out
+    assert out.endswith("4 more not tried: 2 photos in a row failed with network or server errors, so the "
+                        "download stopped early; call again to continue with them")
+
+
+def test_a_success_resets_the_failure_streak(tmp_path, monkeypatch, sleeps):
+    ids = _photos(monkeypatch, 6)
+    _one_worker(monkeypatch)
+    monkeypatch.setattr(server, "GIVE_UP_AFTER", 2)
+
+    def rendition(aid, size):
+        if aid in ("p0", "p2", "p4"):
+            raise _retryable(False)
+        return aid.encode()
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert out.splitlines()[0] == f"Saved 3 photos to {tmp_path}" and "3 failed" in out and "not tried" not in out
+
+
+def _http(status):
+    return server.lr._http_error(f"Rendition 2048 failed ({status}): x", status)
+
+
+def test_permanent_failures_do_not_stop_the_download(tmp_path, monkeypatch, sleeps):
+    ids = _photos(monkeypatch, 30)
+    _one_worker(monkeypatch)  # job order: p0..p29
+    bad = set(ids[:10])
+
+    def rendition(aid, size):
+        if aid in bad:
+            raise _http(404 if aid != "p5" else 403)
+        return aid.encode()
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert out.splitlines()[0] == f"Saved 20 photos to {tmp_path}"
+    assert "10 failed" in out and "not tried" not in out
+
+
+def test_write_errors_do_not_stop_the_download(tmp_path, monkeypatch):
+    ids = _photos(monkeypatch, 12)
+    _one_worker(monkeypatch)
+    monkeypatch.setattr(server.lr, "rendition", lambda aid, size: aid.encode())
+    real = server._write_atomic
+
+    def write(path, data):
+        if path.suffix == ".jpg" and int(path.stem.split("_")[1]) < 9:
+            raise OSError(28, "No space left on device")
+        real(path, data)
+
+    monkeypatch.setattr(server, "_write_atomic", write)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert out.splitlines()[0] == f"Saved 3 photos to {tmp_path}" and "9 failed" in out and "not tried" not in out
+
+
+@pytest.mark.parametrize("error", [_http(503), _http(429), _http(500),
+                                   LrError("GET … failed after 6 attempts: ConnectionResetError()"),
+                                   _retryable(True)])
+def test_outage_like_failures_trip_the_breaker(tmp_path, monkeypatch, sleeps, error):
+    ids = _photos(monkeypatch, 12)
+    _one_worker(monkeypatch)
+
+    def rendition(aid, size):
+        raise error
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert f"\n{server.GIVE_UP_AFTER} failed:\n" in out
+    assert out.endswith(f"{12 - server.GIVE_UP_AFTER} more not tried: {server.GIVE_UP_AFTER} photos in a row failed "
+                        "with network or server errors, so the download stopped early; call again to continue with them")
+
+
+def test_breaker_streak_with_a_mix_of_failures(tmp_path, monkeypatch, sleeps):
+    ids = _photos(monkeypatch, 10)
+    _one_worker(monkeypatch)
+    monkeypatch.setattr(server, "GIVE_UP_AFTER", 3)
+    # outage, outage, 404 (neither counts nor resets), ok (resets), outage, outage, 404, outage -> trips
+    plan = {"p0": _http(503), "p1": _http(503), "p2": _http(404), "p4": _http(502), "p5": _http(500),
+            "p6": _http(404), "p7": _http(503)}
+
+    def rendition(aid, size):
+        if aid in plan:
+            raise plan[aid]
+        return aid.encode()
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert out.splitlines()[0] == f"Saved 1 photos to {tmp_path}"  # p3 only
+    assert "7 failed" in out and "2 more not tried: 3 photos in a row" in out
+
+
+def test_outage_rule():
+    assert server._outage(_http(500)) and server._outage(_http(429)) and server._outage(LrError("network"))
+    assert server._outage(_retryable(True))
+    assert not server._outage(_http(404)) and not server._outage(_http(403)) and not server._outage(_http(400))
+    assert not server._outage(OSError(28, "No space left on device"))
+
+
+def test_retry_respects_the_breaker(monkeypatch, sleeps):
+    calls = []
+
+    def rendition(aid, size):
+        calls.append(aid)
+        raise _retryable(True)
+
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    with pytest.raises(LrError):
+        server._rendition("a1", "fullsize", may_retry=lambda: False)
+    assert calls == ["a1"] and sleeps == []
+    with pytest.raises(LrError):
+        server._rendition("a1", "fullsize", may_retry=lambda: True)
+    assert calls == ["a1"] * (1 + server.DOWNLOAD_ATTEMPTS) and sleeps == [1]
+
+
+def test_breaker_stops_retries_already_under_way(tmp_path, monkeypatch, sleeps):
+    """p1's first attempt fails after p0 has tripped the breaker: p1 is not tried again."""
+    ids = _photos(monkeypatch, 2)
+    monkeypatch.setattr(server, "GIVE_UP_AFTER", 1)
+    monkeypatch.setattr(server, "ThreadPoolExecutor", lambda n: ThreadPoolExecutor(2))
+    may_retry, calls, p1_started = {}, [], threading.Event()
+    real = server._rendition
+
+    def _rendition(aid, size, retry=lambda: True):
+        may_retry[aid] = retry
+        return real(aid, size, retry)
+
+    def rendition(aid, size):
+        calls.append(aid)
+        if aid == "p0":
+            assert p1_started.wait(10)  # both photos are under way
+            raise _http(503)
+        p1_started.set()
+        stop = time.monotonic() + 10
+        while may_retry["p1"]() and time.monotonic() < stop:  # until p0's failure is counted
+            threading.Event().wait(0.001)
+        raise _retryable(True)
+
+    monkeypatch.setattr(server, "_rendition", _rendition)
+    monkeypatch.setattr(server.lr, "rendition", rendition)
+    out = server.lr_download_photos(asset_ids=ids, dest_dir=str(tmp_path))
+    assert sorted(calls) == ["p0", "p1"] and sleeps == []  # without the breaker check p1 would be retried
+    assert "2 failed" in out
+
+
+def test_download_naming_by_id(lib, tmp_path):
+    out = _dl(tmp_path, naming="id")
+    assert out.splitlines()[0] == f"Saved 2 photos to {tmp_path}"
+    assert (tmp_path / "a1.jpg").read_bytes() == b"a1-2048" and (tmp_path / "a2.jpg").exists()
+    assert not (tmp_path / "IMG.jpg").exists()
+    assert set(server._read_sidecar(tmp_path)) == {"a1.jpg", "a2.jpg"}
+    lib.calls.clear()
+    assert "2 unchanged" in _dl(tmp_path, naming="id") and lib.calls == []
+    with pytest.raises(LrError, match="naming"):
+        _dl(tmp_path, naming="title")
+
+
+def _entry(i):
+    return {"asset_id": f"id{i}", "size": "640", "updated": "t", "bytes": i}
+
+
+def test_sidecar_threads_do_not_lose_entries(tmp_path):
+    sidecar = server._Sidecar(tmp_path)
+    threads = [threading.Thread(target=lambda t=t: [sidecar.add(f"t{t}-{i}.jpg", _entry(i)) for i in range(25)])
+               for t in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sidecar.flush() is None
+    assert len(server._read_sidecar(tmp_path)) == 200
+
+
+WRITER = """
+import sys
+from pathlib import Path
+from lr_mcp import server
+sidecar = server._Sidecar(Path(sys.argv[1]))
+for i in range(60):
+    sidecar.add(f"{sys.argv[2]}-{i}.jpg", {"asset_id": str(i), "size": "640", "updated": "t", "bytes": i})
+assert sidecar.flush() is None
+"""
+
+
+def test_two_processes_writing_one_sidecar_keep_all_entries(tmp_path):
+    procs = [subprocess.Popen([sys.executable, "-c", WRITER, str(tmp_path), name]) for name in ("p", "q")]
+    assert [p.wait(timeout=60) for p in procs] == [0, 0]
+    entries = json.loads((tmp_path / server.SIDECAR).read_text())  # valid JSON, never half-written
+    assert len(entries) == 120
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_edited_survives_null_develop():
