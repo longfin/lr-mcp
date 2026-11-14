@@ -392,3 +392,78 @@ def test_get_fails_fast_on_dns_error(monkeypatch):
     with pytest.raises(lr.LrError, match="failed after 1 attempt:"):
         lr.request("GET", "/v2/account")
     assert slept == []
+
+
+def album_pages(monkeypatch, sizes):
+    """Serve album `a` as pages of the given sizes; returns the list of fetched URLs."""
+    base = lr.LR + "/v2/catalogs/c/"
+    fetched = []
+
+    def get_json(url, auth=True):
+        fetched.append(url)
+        i = int(url.partition("&page=")[2] or 0)
+        page = {"base": base, "resources": [{"id": f"{i}-{k}"} for k in range(sizes[i])]}
+        if i + 1 < len(sizes):
+            page["links"] = {"next": {"href": f"albums/a/assets?limit=500&page={i + 1}"}}
+        return page
+
+    monkeypatch.setattr(lr, "catalog_path", lambda: "/v2/catalogs/c/")
+    monkeypatch.setattr(lr, "get_json", get_json)
+    monkeypatch.setattr(lr, "_count_cache", {})
+    return fetched
+
+
+def test_album_asset_count_adds_up_pages_without_embedding_assets(monkeypatch):
+    fetched = album_pages(monkeypatch, [500, 500, 37])
+    assert lr.album_asset_count("a") == 1037
+    assert fetched[0] == lr.LR + "/v2/catalogs/c/albums/a/assets?limit=500"
+    assert len(fetched) == 3 and not any("embed" in u for u in fetched)
+
+
+def test_album_asset_count_of_empty_album(monkeypatch):
+    album_pages(monkeypatch, [0])
+    assert lr.album_asset_count("a") == 0
+
+
+def test_album_asset_count_is_cached_until_updated_changes(monkeypatch):
+    fetched = album_pages(monkeypatch, [3])
+    assert lr.album_asset_count("a", "2024-01-01") == 3
+    assert lr.album_asset_count("a", "2024-01-01") == 3
+    assert len(fetched) == 1
+    assert lr.album_asset_count("a", "2024-02-02") == 3
+    assert len(fetched) == 2
+
+
+def test_album_asset_count_cache_expires(monkeypatch):
+    fetched = album_pages(monkeypatch, [3])
+    now = [1000.0]
+    monkeypatch.setattr(lr.time, "monotonic", lambda: now[0])
+    lr.album_asset_count("a", "2024-01-01")
+    now[0] += lr.COUNT_TTL - 1
+    lr.album_asset_count("a", "2024-01-01")
+    assert len(fetched) == 1
+    now[0] += 2
+    lr.album_asset_count("a", "2024-01-01")
+    assert len(fetched) == 2
+
+
+def test_album_asset_count_gives_up_at_deadline_with_pages_left(monkeypatch):
+    fetched = album_pages(monkeypatch, [500, 500, 37])
+    assert lr.album_asset_count("a", "u", deadline=time.monotonic() - 1) is None
+    assert len(fetched) == 1
+    assert lr._count_cache == {}  # a partial count must not be cached
+    assert lr.album_asset_count("a", "u") == 1037
+
+
+def test_album_asset_count_keeps_a_count_finished_past_the_deadline(monkeypatch):
+    album_pages(monkeypatch, [37])
+    assert lr.album_asset_count("a", "u", deadline=time.monotonic() - 1) == 37
+
+
+def test_forget_album_count(monkeypatch):
+    fetched = album_pages(monkeypatch, [3])
+    lr.album_asset_count("a", "u")
+    lr.forget_album_count("a")
+    lr.forget_album_count("never-counted")
+    lr.album_asset_count("a", "u")
+    assert len(fetched) == 2

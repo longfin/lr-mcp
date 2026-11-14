@@ -365,14 +365,54 @@ def catalog_path():
     return _catalog
 
 
-def paginate(path):
-    """Yield `resources` across pages. `links.next.href` is relative to the response's `base`."""
+def _pages(path):
+    """Yield each page's response. `links.next.href` is relative to the response's `base`."""
     url = LR + path
     while url:
         data = get_json(url)
-        yield from data.get("resources", [])
+        yield data
         nxt = data.get("links", {}).get("next", {}).get("href")
         url = urllib.parse.urljoin(data["base"], nxt) if nxt else None
+
+
+def paginate(path):
+    """Yield `resources` across pages."""
+    for data in _pages(path):
+        yield from data.get("resources", [])
+
+
+COUNT_TTL = 600     # seconds a count is trusted; see album_asset_count
+_count_cache = {}   # album_id -> (album `updated`, time.monotonic() when counted, count)
+
+
+def album_asset_count(album_id, updated=None, deadline=None):
+    """Number of assets (photos and videos) in an album.
+
+    The API has no count field, so this pages through the album's asset list without embedding
+    the assets: one small request per 500 assets.
+
+    updated: the album's `updated` timestamp from the albums listing. A cached count is reused
+    while it is unchanged and younger than COUNT_TTL. The time limit is needed because `updated`
+    does not always move when photos are added to an album.
+    deadline: a time.monotonic() value. Returns None, caching nothing, when it passes while
+    pages are still left to fetch.
+    """
+    hit = _count_cache.get(album_id)
+    if hit and hit[0] == updated and time.monotonic() - hit[1] < COUNT_TTL:
+        return hit[2]
+    n = 0
+    for data in _pages(catalog_path() + f"albums/{album_id}/assets?limit=500"):
+        n += len(data.get("resources", []))
+        more = data.get("links", {}).get("next", {}).get("href")
+        if more and deadline is not None and time.monotonic() > deadline:
+            return None
+    _count_cache[album_id] = (updated, time.monotonic(), n)
+    return n
+
+
+def forget_album_count(album_id):
+    """Drop the cached count of an album whose contents were just changed."""
+    _count_cache.pop(album_id, None)
 
 
 def rendition(asset_id, kind):

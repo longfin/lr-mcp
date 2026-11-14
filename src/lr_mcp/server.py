@@ -40,6 +40,7 @@ mcp = MCPServer(
 _albums_cache = (0.0, None)
 MAX_SCAN = 20000   # assets lr_list_photos looks at before giving up
 SCAN_SECONDS = 60  # ...or the time it spends, leaving room for one slow page; clients time out at ~120 s
+COUNT_SECONDS = 60  # time lr_list_albums spends counting photos, for the same reason
 
 
 def _albums():
@@ -246,11 +247,43 @@ def lr_account() -> str:
     return "\n".join(lines)
 
 
+def _album_counts(albums):
+    """({album_id: count}, note) for the given albums, counted in parallel within COUNT_SECONDS.
+    Albums that ran out of time or failed are left out of the dict and explained in the note."""
+    lr.catalog_path()  # resolve once here instead of once per worker thread
+    deadline = time.monotonic() + COUNT_SECONDS
+
+    def count(a):
+        if time.monotonic() > deadline:
+            return None
+        try:
+            return lr.album_asset_count(a["id"], a.get("updated"), deadline)
+        except LrError as e:
+            return e
+
+    with ThreadPoolExecutor(6) as ex:
+        results = list(ex.map(count, albums))
+    counts = {a["id"]: r for a, r in zip(albums, results) if isinstance(r, int)}
+    late = sum(r is None for r in results)
+    errors = [r for r in results if isinstance(r, LrError)]
+    notes = []
+    if late:
+        notes.append(f"{late} not counted, time limit reached — call again to count the rest "
+                     "(finished counts are cached), or narrow with query")
+    if errors:
+        notes.append(f"{len(errors)} could not be counted: {errors[0]}")
+    return counts, "; ".join(notes)
+
+
 @mcp.tool()
-def lr_list_albums(query: str | None = None, include_folders: bool = True) -> str:
+def lr_list_albums(query: str | None = None, include_folders: bool = True, include_counts: bool = False) -> str:
     """List albums as 'Folder / Album' paths with their ids.
     query: case-insensitive substring of the path, e.g. 'kyoto' or '2024'.
-    Folders are tagged [folder]; project albums created by this server are tagged [project]."""
+    Folders are tagged [folder]; project albums created by this server are tagged [project].
+    include_counts: append each album's photo count (videos included), e.g. '... (id)  112 photos'.
+    Folders get no count. This costs a request per album, so pass a query when you can. Counting
+    stops after 60 s; the first line then says how many albums are left, they are listed with
+    '? photos', and calling again continues from there. Counts are cached for up to 10 minutes."""
     paths = _album_paths()
     rows = []
     for a in _albums():
@@ -260,11 +293,24 @@ def lr_list_albums(query: str | None = None, include_folders: bool = True) -> st
         if query and query.lower() not in p.lower():
             continue
         tag = {"collection_set": "[folder] ", "project": "[project] "}.get(a["subtype"], "")
-        rows.append(f"{tag}{p}  ({a['id']})")
-    rows.sort()
+        rows.append((f"{tag}{p}  ({a['id']})", a))
+    rows.sort(key=lambda r: r[0])
     if not rows:
         return "No matching albums."
-    return f"{len(rows)} albums\n" + "\n".join(rows)
+    head = f"{len(rows)} albums"
+    if not include_counts:
+        return head + "\n" + "\n".join(line for line, _ in rows)
+    countable = [a for _, a in rows if a["subtype"] != "collection_set"]
+    counts, note = _album_counts(countable)
+    if note:
+        head += f" ({note})"
+    lines = []
+    for line, a in rows:
+        if a["subtype"] != "collection_set":
+            n = counts.get(a["id"], "?")
+            line += f"  {n} photo{'' if n == 1 else 's'}"
+        lines.append(line)
+    return head + "\n" + "\n".join(lines)
 
 
 @mcp.tool()
@@ -575,6 +621,7 @@ def lr_add_to_project_album(album_id: str, asset_ids: list[str]) -> str:
         added += len(data.get("resources", []))
         for e in data.get("errors", []):
             errors.append(f"{e.get('id')}: {e.get('description')} {e.get('errors', '')}")
+    lr.forget_album_count(album_id)
     msg = f"Added {added} photos"
     if errors:
         msg += f", {len(errors)} failed:\n" + "\n".join(errors[:20])
@@ -589,6 +636,7 @@ def lr_delete_project_album(album_id: str) -> str:
         raise LrError(f"Deleting the album failed ({status}): {lr.parse(body)}")
     global _albums_cache
     _albums_cache = (0.0, None)
+    lr.forget_album_count(album_id)
     return f"Deleted album {album_id}"
 
 

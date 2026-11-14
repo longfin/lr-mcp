@@ -31,6 +31,7 @@ def catalog(monkeypatch):
     monkeypatch.setattr(server.lr, "catalog_path", lambda: "/v2/catalogs/c/")
     server._albums_cache = (0.0, None)
     server._album_cache.clear()
+    server.lr._count_cache.clear()
     monkeypatch.setattr(server.lr, "get_json", lambda path: {"id": "x", "payload": {}})
 
 
@@ -580,3 +581,86 @@ def test_download_sidecar_write_failure_is_a_warning(tmp_path, lib, monkeypatch)
 def test_edited_survives_null_develop():
     assert server._edited({"id": "x", "payload": {"develop": None, "userUpdated": "2024-01-01T00:00:00Z"}}) == "2024-01-01T00:00:00Z"
     assert server._edited({"id": "x", "payload": None}) is None
+
+
+ALBUMS = [
+    {"id": "f", "subtype": "collection_set", "updated": "u0", "payload": {"name": "Travel"}},
+    {"id": "a", "subtype": "collection", "updated": "u1", "payload": {"name": "Kyoto", "parent": {"id": "f"}}},
+    {"id": "b", "subtype": "collection", "updated": "u2", "payload": {"name": "Osaka", "parent": {"id": "f"}}},
+    {"id": "p", "subtype": "project", "updated": "u3", "payload": {"name": "Picks"}},
+]
+
+
+def count_albums(monkeypatch, sizes):
+    """Serve ALBUMS and count from `sizes`; returns the list of (album_id, updated) that were counted."""
+    calls = []
+
+    def count(album_id, updated=None, deadline=None):
+        calls.append((album_id, updated))
+        n = sizes[album_id]
+        if isinstance(n, Exception):
+            raise n
+        return n
+
+    monkeypatch.setattr(server.lr, "paginate", lambda path: iter(ALBUMS))
+    monkeypatch.setattr(server.lr, "album_asset_count", count)
+    return calls
+
+
+def test_list_albums_does_not_count_by_default(monkeypatch):
+    calls = count_albums(monkeypatch, {})
+    assert server.lr_list_albums().splitlines() == [
+        "4 albums", "Travel / Kyoto  (a)", "Travel / Osaka  (b)", "[folder] Travel  (f)", "[project] Picks  (p)"]
+    assert calls == []
+
+
+def test_list_albums_with_counts(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 112, "b": 1, "p": 0})
+    assert server.lr_list_albums(include_counts=True).splitlines() == [
+        "4 albums",
+        "Travel / Kyoto  (a)  112 photos",
+        "Travel / Osaka  (b)  1 photo",
+        "[folder] Travel  (f)",  # folders are not counted
+        "[project] Picks  (p)  0 photos",
+    ]
+    assert sorted(calls) == [("a", "u1"), ("b", "u2"), ("p", "u3")]
+
+
+def test_list_albums_counts_only_albums_matching_query(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 20})
+    assert server.lr_list_albums(query="kyoto", include_counts=True) == "1 albums\nTravel / Kyoto  (a)  20 photos"
+    assert calls == [("a", "u1")]
+
+
+def test_list_albums_counts_stop_at_time_limit(monkeypatch):
+    calls = count_albums(monkeypatch, {"a": 5, "b": 5, "p": 5})
+    monkeypatch.setattr(server, "COUNT_SECONDS", -1)
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("4 albums (3 not counted, time limit reached")
+    assert out[1:] == ["Travel / Kyoto  (a)  ? photos", "Travel / Osaka  (b)  ? photos", "[folder] Travel  (f)",
+                       "[project] Picks  (p)  ? photos"]
+    assert calls == []  # nothing is started once the time is up
+
+
+def test_list_albums_counts_album_cut_off_midway(monkeypatch):
+    count_albums(monkeypatch, {"a": 5, "b": None, "p": 5})  # None: the deadline passed between pages
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0].startswith("4 albums (1 not counted, time limit reached")
+    assert "Travel / Osaka  (b)  ? photos" in out and "Travel / Kyoto  (a)  5 photos" in out
+
+
+def test_list_albums_counts_survive_one_failing_album(monkeypatch):
+    count_albums(monkeypatch, {"a": 5, "b": LrError("GET albums/b/assets returned 404: gone"), "p": 2})
+    out = server.lr_list_albums(include_counts=True).splitlines()
+    assert out[0] == "4 albums (1 could not be counted: GET albums/b/assets returned 404: gone)"
+    assert out[1:] == ["Travel / Kyoto  (a)  5 photos", "Travel / Osaka  (b)  ? photos", "[folder] Travel  (f)",
+                       "[project] Picks  (p)  2 photos"]
+
+
+def test_changing_a_project_album_forgets_its_count(monkeypatch):
+    monkeypatch.setattr(server.lr, "request", lambda method, path, body=None: (
+        (204, b"") if method == "DELETE" else (201, b'{"resources": [{"id": "x"}]}')))
+    server.lr._count_cache.update({"p": ("u3", 0.0, 3), "q": ("u4", 0.0, 4), "a": ("u1", 0.0, 9)})
+    server.lr_add_to_project_album("p", ["x"])
+    server.lr_delete_project_album("q")
+    assert list(server.lr._count_cache) == ["a"]
