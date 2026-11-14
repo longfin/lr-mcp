@@ -164,12 +164,12 @@ for entry in catalog.album_assets(album_id):           # the album's own order, 
 
 | Function | Returns |
 |---|---|
-| `catalog.album_info(album_id)` | `{"id", "name", "parent", "subtype", "sort"}`. `parent` is the folder id or `None`; `subtype` is `collection`, `collection_set` (folder) or `project`; `sort` is `captureDateAsc`, `captureDateDesc` or `customAsc` (`captureDateAsc` when the album has none; another value is passed through). Fetched at most once a minute. |
+| `catalog.album_info(album_id)` | `{"id", "name", "parent", "subtype", "sort"}`, each a string or `None`. `parent` is the folder id or `None`; `subtype` is `collection`, `collection_set` (folder) or `project`; `sort` is `captureDateAsc`, `captureDateDesc` or `customAsc` (`captureDateAsc` when the album has none; other text is passed through). Fetched at most once a minute. |
 | `catalog.album_assets(album_id, images_only=True)` | A list of `{"asset", "order"}` in the album's order: the custom order when the album uses one (assets without an order key last, by capture date), else capture date ascending or descending. `asset` is the asset resource as the API returns it; `order` is the album-asset sort key as a string, or `None`. `images_only=False` keeps videos. |
-| `catalog.asset_summary(asset)` | `id`, `subtype`, `file`, `captured`, `rating`, `flag`, `camera`, `lens`, `iso`, `fnumber`, `shutter` (`"1/250"`), `exposure_time` (seconds), `focal_length` (mm), `original` and `cropped` (`(width, height)`), `orientation` (EXIF value; sizes are not swapped for it), `gps` (`(latitude, longitude)`), `title`, `caption`, `keywords` (a list, `[]` when none), `edited`. Missing values are `None`. |
+| `catalog.asset_summary(asset)` | Strings: `id`, `subtype`, `file`, `captured`, `flag`, `camera`, `lens`, `shutter` (`"1/250"`, `"30"`, `"0.5"`), `title`, `caption`, `edited`. `rating`: int. `iso`, `orientation` (EXIF value; sizes are not swapped for it): numbers. `fnumber`, `exposure_time` (seconds), `focal_length` (mm): floats. `original`, `cropped` (`(width, height)`) and `gps` (`(latitude, longitude)`): pairs of numbers. `keywords`: a list of strings, `[]` when none. A value that is missing, or not of that type in the API response, is `None`; numbers are never bools, NaN or infinite. |
 | `catalog.asset_edited(asset)` | The asset's edit timestamp (`develop.userUpdated`, else `userUpdated`, else `changedAtTime`), or `None`. It moves when develop settings or the crop change, not on rating or flag edits. |
 
-Errors are raised as `lr_mcp.catalog.LrError`; an unknown album id gives `Album not found: <id>. ...`. `lr_mcp.client.album_asset_count(album_id)` counts an album's assets (videos included) without reading them.
+Errors are raised as `lr_mcp.catalog.LrError`; an unknown album id gives `Album not found: <id>. ...` with `status == 404`. `lr_mcp.client.album_asset_count(album_id)` counts an album's assets (videos included) without reading them.
 
 ## Development
 

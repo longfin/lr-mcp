@@ -19,9 +19,17 @@ _album_cache = {}  # album_id -> (time.time() when fetched, album resource)
 
 # ---------------------------------------------------------------- albums
 
+def _dict(v):
+    return v if isinstance(v, dict) else {}
+
+
+def _str(v):
+    return v if isinstance(v, str) else None
+
+
 def _sort_mode(album):
-    """payload.assetSortOrder of an album resource; captureDateAsc when missing."""
-    return (album.get("payload") or {}).get("assetSortOrder") or "captureDateAsc"
+    """payload.assetSortOrder of an album resource; captureDateAsc when missing or not text."""
+    return _str(_dict(album.get("payload")).get("assetSortOrder")) or "captureDateAsc"
 
 
 def _album(album_id):
@@ -31,25 +39,29 @@ def _album(album_id):
             a = lr.get_json(lr.catalog_path() + f"albums/{album_id}")
         except LrError as e:
             if e.status == 404:
-                raise LrError(f"Album not found: {album_id}. Find album ids with lr_list_albums.") from None
+                missing = LrError(f"Album not found: {album_id}. Find album ids with lr_list_albums.")
+                missing.status = 404
+                raise missing from None
             raise
         _album_cache[album_id] = (time.time(), a)
     return a
 
 
 def album_info(album_id):
-    """One album as {"id", "name", "parent", "subtype", "sort"}.
+    """One album as {"id", "name", "parent", "subtype", "sort"}; every value is a str, or None.
 
+    name: the album's name.
     parent: id of the folder (collection_set) holding it, or None.
     subtype: "collection" (an album), "collection_set" (a folder) or "project" (made through the API).
     sort: payload.assetSortOrder, one of SORT_MODES ("captureDateAsc", "captureDateDesc",
-    "customAsc"); "captureDateAsc" when the album has none, and any other value passed through as-is.
-    The album is fetched at most once a minute. An unknown id raises LrError("Album not found: ...").
+    "customAsc"); "captureDateAsc" when the album has none, and any other text passed through as-is.
+    The album is fetched at most once a minute. An unknown id raises LrError("Album not found: ...")
+    with status 404.
     """
     a = _album(album_id)
-    p = a.get("payload") or {}
-    return {"id": a.get("id", album_id), "name": p.get("name"), "parent": (p.get("parent") or {}).get("id"),
-            "subtype": a.get("subtype"), "sort": _sort_mode(a)}
+    p = _dict(a.get("payload"))
+    return {"id": _str(a.get("id")) or album_id, "name": _str(p.get("name")),
+            "parent": _str(_dict(p.get("parent")).get("id")), "subtype": _str(a.get("subtype")), "sort": _sort_mode(a)}
 
 
 def _album_entries(album_id):
@@ -63,7 +75,7 @@ def _in_album_order(entries, mode):
     """entries ({"asset", "order", ...}) sorted as an album with sort mode `mode` shows them.
     customAsc: by order key, entries without one last; ties and those keep capture order.
     captureDateDesc: newest capture first. Anything else: oldest capture first."""
-    out = sorted(entries, key=lambda e: (e["asset"].get("payload") or {}).get("captureDate") or "",
+    out = sorted(entries, key=lambda e: _str(_dict(e["asset"].get("payload")).get("captureDate")) or "",
                  reverse=mode == "captureDateDesc")
     if mode == "customAsc":
         out.sort(key=lambda e: (e["order"] is None, e["order"] or ""))
@@ -89,21 +101,29 @@ def album_assets(album_id, images_only=True):
 
 # ---------------------------------------------------------------- assets
 
-def _frac(v):
-    if isinstance(v, list) and len(v) == 2 and v[1]:
-        return v[0] / v[1]
-    return v
-
-
 def _num(v):
+    """A finite int or float; bools are not numbers here."""
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _pair(v):
+    """[numerator, denominator] of finite numbers with a non-zero denominator."""
+    return isinstance(v, list) and len(v) == 2 and _num(v[0]) and _num(v[1]) and v[1] != 0
+
+
+def _float(v):
+    """A rational [n, d] or a number as a finite float, else None."""
+    if _pair(v):
+        v = v[0] / v[1]
+    return float(v) if _num(v) else None
 
 
 def _latest(d, key):
     """ratings/reviews are shaped {user_id: {key, date}}; return the most recent value."""
-    if not d:
+    entries = [x for x in _dict(d).values() if isinstance(x, dict)]
+    if not entries:
         return None
-    v = max(d.values(), key=lambda x: x.get("date", ""))
+    v = max(entries, key=lambda x: _str(x.get("date")) or "")
     return v.get(key)
 
 
@@ -129,55 +149,70 @@ def _keywords(v):
 
 
 def _shutter(v):
-    """ExposureTime [n, d] as '1/250' or '30'; any other value as-is."""
-    if isinstance(v, list) and len(v) == 2 and v[1]:
+    """ExposureTime [n, d] as '1/250' or '30', a number as '0.5', text as-is; else None."""
+    if _pair(v):
         return f"{v[0]}/{v[1]}" if v[0] < v[1] else f"{v[0] / v[1]:g}"
-    return v
+    if _num(v):
+        return f"{v:g}"
+    return _str(v)
+
+
+def _iso(v):
+    """ISOSpeedRatings: a number, or the first of a list of them (XMP stores it as a sequence)."""
+    if isinstance(v, list) and v:
+        v = v[0]
+    return v if _num(v) else None
 
 
 def asset_edited(asset):
     """Edit timestamp of an asset resource, or None. develop.userUpdated moves only when develop
     settings (incl. crop) change, so rating/flag edits don't count; falls back to the asset-wide
-    userUpdated, then changedAtTime. lr_download_photos uses it to skip unchanged photos."""
-    p = asset.get("payload") or {}
-    return (p.get("develop") or {}).get("userUpdated") or p.get("userUpdated") or p.get("changedAtTime")
+    userUpdated, then changedAtTime (the first that is non-empty text). lr_download_photos uses it
+    to skip unchanged photos."""
+    p = _dict(asset.get("payload"))
+    for v in (_dict(p.get("develop")).get("userUpdated"), p.get("userUpdated"), p.get("changedAtTime")):
+        if isinstance(v, str) and v:
+            return v
+    return None
 
 
 def asset_summary(asset):
-    """Metadata of an asset resource as plain data; a field the asset lacks is None.
+    """Metadata of an asset resource as plain data. A field the asset lacks, or holds in an
+    unexpected type, is None (keywords: []). Numbers are never bools, NaN or infinite.
 
-    id, subtype ("image", "video", ...), file (original file name), captured (captureDate as
-    stored, camera-local time), rating (0-5, latest), flag ("pick", "reject", "unflagged"; latest),
-    camera ("Make Model"), lens, iso, fnumber (float), shutter (exposure time as text: "1/250",
-    "30"), exposure_time (seconds, float), focal_length (mm, float),
-    original ((width, height) of the original file), cropped ((width, height) after the crop,
-    as floats), orientation (EXIF value; 6 and 8 are 90-degree rotations; sizes are as stored and
-    not swapped for it), gps ((latitude, longitude)), title, caption (whitespace collapsed to one
-    line, '|' replaced by '/'), keywords (list of strings, [] when none), edited (asset_edited).
+    id; subtype, file (original file name), captured (captureDate as stored, camera-local time),
+    flag ("pick", "reject", "unflagged"; latest), camera ("Make Model"), lens: str.
+    rating: int 0-5 (latest). iso: number. fnumber, exposure_time (seconds), focal_length (mm): float.
+    shutter: exposure time as text ("1/250", "30", "0.5").
+    original ((width, height) of the original file) and cropped ((width, height) after the crop):
+    pairs of numbers. orientation: number, the EXIF value (6 and 8 are 90-degree rotations; sizes
+    are as stored and not swapped for it). gps: (latitude, longitude) numbers.
+    title, caption: str, whitespace collapsed to one line, '|' replaced by '/'.
+    keywords: list of str. edited: str (asset_edited).
     """
-    p = asset.get("payload") or {}
-    xmp = p.get("xmp") or {}
-    exif, tiff, dc = xmp.get("exif") or {}, xmp.get("tiff") or {}, xmp.get("dc") or {}
-    dev, loc, imp = p.get("develop") or {}, p.get("location") or {}, p.get("importSource") or {}
+    p = _dict(asset.get("payload"))
+    xmp = _dict(p.get("xmp"))
+    exif, tiff, dc = _dict(xmp.get("exif")), _dict(xmp.get("tiff")), _dict(xmp.get("dc"))
+    dev, loc, imp = _dict(p.get("develop")), _dict(p.get("location")), _dict(p.get("importSource"))
     cw, ch = dev.get("croppedWidth"), dev.get("croppedHeight")
+    ow, oh = imp.get("originalWidth"), imp.get("originalHeight")
     lat, lon = loc.get("latitude"), loc.get("longitude")
-    fnum, focal = _frac(exif.get("FNumber")), _frac(exif.get("FocalLength"))
-    exposure = _frac(exif.get("ExposureTime"))
+    rating = _latest(p.get("ratings"), "rating")
     return {
         "id": asset["id"],
-        "subtype": asset.get("subtype"),
-        "file": imp.get("fileName"),
-        "captured": p.get("captureDate"),
-        "rating": _latest(p.get("ratings"), "rating"),
-        "flag": _latest(p.get("reviews"), "flag"),
-        "camera": " ".join(filter(None, [tiff.get("Make"), tiff.get("Model")])) or None,
-        "lens": (xmp.get("aux") or {}).get("Lens"),
-        "iso": exif.get("ISOSpeedRatings"),
-        "fnumber": fnum if _num(fnum) else None,
+        "subtype": _str(asset.get("subtype")),
+        "file": _str(imp.get("fileName")),
+        "captured": _str(p.get("captureDate")),
+        "rating": rating if isinstance(rating, int) and not isinstance(rating, bool) else None,
+        "flag": _str(_latest(p.get("reviews"), "flag")),
+        "camera": " ".join(v for v in (tiff.get("Make"), tiff.get("Model")) if isinstance(v, str) and v) or None,
+        "lens": _str(_dict(xmp.get("aux")).get("Lens")),
+        "iso": _iso(exif.get("ISOSpeedRatings")),
+        "fnumber": _float(exif.get("FNumber")),
         "shutter": _shutter(exif.get("ExposureTime")),
-        "exposure_time": exposure if _num(exposure) else None,
-        "focal_length": focal if _num(focal) else None,
-        "original": (imp.get("originalWidth"), imp.get("originalHeight")) if imp.get("originalWidth") else None,
+        "exposure_time": _float(exif.get("ExposureTime")),
+        "focal_length": _float(exif.get("FocalLength")),
+        "original": (ow, oh) if _num(ow) and ow and _num(oh) else None,  # no width: no size, as before
         "cropped": (cw, ch) if _num(cw) and _num(ch) else None,
         "orientation": dev.get("userOrientation") if _num(dev.get("userOrientation")) else None,
         "gps": (lat, lon) if _num(lat) and _num(lon) else None,

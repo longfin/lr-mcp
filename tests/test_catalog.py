@@ -212,3 +212,114 @@ def test_tools_share_the_album_cache(album):
 def test_catalog_imports_without_the_server():
     code = "import sys, lr_mcp.catalog; assert 'lr_mcp.server' not in sys.modules"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_album_not_found_keeps_the_status(monkeypatch):
+    _missing(monkeypatch, 404)
+    with pytest.raises(LrError) as e:
+        catalog.album_info("gone")
+    assert e.value.status == 404
+
+
+def test_album_info_types_on_malformed_album(album, monkeypatch):
+    monkeypatch.setattr(catalog.lr, "get_json", lambda path, auth=True, deadline=None: {
+        "id": 5, "subtype": ["collection"], "payload": {"name": 3, "parent": "f", "assetSortOrder": {"x": 1}}})
+    assert catalog.album_info("x") == {"id": "x", "name": None, "parent": None, "subtype": None,
+                                       "sort": "captureDateAsc"}
+    catalog._album_cache.clear()
+    monkeypatch.setattr(catalog.lr, "get_json", lambda path, auth=True, deadline=None: {"id": "x", "payload": [1]})
+    assert catalog.album_info("x")["sort"] == "captureDateAsc"
+
+
+def _exif(**exif):
+    return _asset("a", "2024-05-01T00:00:00", xmp={"exif": exif})
+
+
+@pytest.mark.parametrize("value, shutter, seconds", [
+    (0.5, "0.5", 0.5),
+    (2, "2", 2.0),
+    ([1, 250], "1/250", 0.004),
+    ("1/60", "1/60", None),        # text is kept as text, but it is no number
+    ([1, 0], None, None),
+    ([True, 2], None, None),
+    (True, None, None),
+    ({"n": 1}, None, None),
+    (float("nan"), None, None),
+])
+def test_asset_summary_shutter_is_text(value, shutter, seconds):
+    s = catalog.asset_summary(_exif(ExposureTime=value))
+    assert s["shutter"] == shutter and s["exposure_time"] == seconds
+    assert s["shutter"] is None or isinstance(s["shutter"], str)
+    assert s["exposure_time"] is None or type(s["exposure_time"]) is float
+
+
+def test_numeric_shutter_keeps_the_tool_line():
+    a = _exif(ExposureTime=0.5, FNumber=8, FocalLength=35)
+    assert server._fmt(server._summary(a)) == "a | ? | 2024-05-01T00:00:00 | f/8 0.5s 35mm"
+
+
+def test_asset_summary_floats_from_ints():
+    s = catalog.asset_summary(_exif(FNumber=8, FocalLength=35, ExposureTime=1))
+    assert (s["fnumber"], s["focal_length"], s["exposure_time"]) == (8.0, 35.0, 1.0)
+    assert all(type(s[k]) is float for k in ("fnumber", "focal_length", "exposure_time"))
+    s = catalog.asset_summary(_exif(FNumber=[28, 10], FocalLength=[50, 1]))
+    assert type(s["fnumber"]) is float and type(s["focal_length"]) is float
+    s = catalog.asset_summary(_exif(FNumber=True, FocalLength="35", ExposureTime=[1, False]))
+    assert s["fnumber"] is None and s["focal_length"] is None and s["exposure_time"] is None
+
+
+@pytest.mark.parametrize("width, height", [(6000, None), (6000, "4000"), (True, 4000), (6000, float("nan")),
+                                           (0, 4000), (None, 4000)])
+def test_asset_summary_original_needs_two_numbers(width, height):
+    a = _asset("a", "2024-05-01T00:00:00", importSource={"originalWidth": width, "originalHeight": height})
+    assert catalog.asset_summary(a)["original"] is None
+    assert server._summary(a)["size"] is None  # the tool printed e.g. "size: 6000xNone" before
+
+
+def test_asset_summary_types_on_malformed_asset():
+    a = {"id": "a", "subtype": 1, "payload": {
+        "captureDate": 20240501, "importSource": {"fileName": ["x.jpg"]},
+        "xmp": {"exif": {"ISOSpeedRatings": "100"}, "tiff": {"Make": 1, "Model": "M"}, "aux": {"Lens": {"x": 1}},
+                "dc": {"title": 5, "subject": [1, "sea"]}},
+        "ratings": {"u": {"rating": True, "date": None}, "v": "junk"},
+        "reviews": {"u": {"flag": 1, "date": "2024"}},
+        "develop": {"userOrientation": True, "userUpdated": 17},
+        "location": {"latitude": "35", "longitude": 129},
+        "userUpdated": "", "changedAtTime": "2024-07-01T00:00:00Z",
+    }}
+    s = catalog.asset_summary(a)
+    assert s == {**{k: None for k in s}, "id": "a", "camera": "M", "keywords": ["sea"],
+                 "edited": "2024-07-01T00:00:00Z"}
+
+
+def test_asset_summary_sections_of_the_wrong_type():
+    a = {"id": "a", "payload": {"xmp": {"exif": [1], "tiff": "x", "dc": 3, "aux": []}, "develop": [],
+                                "location": "x", "importSource": [], "ratings": [5], "reviews": "pick"}}
+    s = catalog.asset_summary(a)
+    assert s["keywords"] == [] and all(v is None for k, v in s.items() if k not in ("id", "keywords"))
+    assert catalog.asset_summary({"id": "b", "payload": "x"})["captured"] is None
+
+
+@pytest.mark.parametrize("iso, expected", [(400, 400), ([800], 800), ([], None), ("100", None), (True, None)])
+def test_asset_summary_iso(iso, expected):
+    assert catalog.asset_summary(_exif(ISOSpeedRatings=iso))["iso"] == expected
+
+
+def test_asset_summary_rating_is_an_int():
+    a = _asset("a", "2024-05-01T00:00:00", ratings={"u": {"rating": 4.5, "date": "2024"}})
+    assert catalog.asset_summary(a)["rating"] is None
+    a["payload"]["ratings"]["v"] = {"rating": 3, "date": "2025"}
+    assert catalog.asset_summary(a)["rating"] == 3
+
+
+def test_asset_edited_skips_values_that_are_not_text():
+    assert catalog.asset_edited({"payload": {"develop": {"userUpdated": 5}, "userUpdated": "u"}}) == "u"
+    assert catalog.asset_edited({"payload": {"develop": "x", "userUpdated": {"t": 1}}}) is None
+
+
+def test_album_order_tolerates_odd_capture_dates(album, monkeypatch):
+    entries = [{"asset": _asset("num", 20240501), "payload": {}},
+               {"asset": _asset("str", "2024-05-01T00:00:00"), "payload": {}}]
+    monkeypatch.setattr(catalog.lr, "paginate", lambda path: iter(entries))
+    album.payload = {"assetSortOrder": "captureDateAsc"}
+    assert _ids(catalog.album_assets("x")) == ["num", "str"]
