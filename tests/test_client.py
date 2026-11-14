@@ -37,6 +37,16 @@ def test_get_json_raises_lr_error(monkeypatch):
         lr.get_json("/v2/account")
 
 
+def test_token_request_error_carries_the_status(monkeypatch):
+    def urlopen(req, timeout=None):
+        raise lr.urllib.error.HTTPError("https://x", 400, "bad", email.message.Message(), io.BytesIO(b'{"error": "invalid_grant"}'))
+
+    monkeypatch.setattr(lr.urllib.request, "urlopen", urlopen)
+    with pytest.raises(lr.LrError, match="Token request failed") as e:
+        lr._token_request({"grant_type": "refresh_token", "refresh_token": "rt"})
+    assert e.value.status == 400
+
+
 def test_missing_client_id(monkeypatch):
     monkeypatch.delenv("ADOBE_CLIENT_ID")
     with pytest.raises(lr.LrError, match="ADOBE_CLIENT_ID"):

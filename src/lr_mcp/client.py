@@ -49,7 +49,16 @@ LR = "https://lr.adobe.io"
 
 
 class LrError(ToolError):
-    """Subclasses ToolError so the message reaches the model instead of a generic error."""
+    """Subclasses ToolError so the message reaches the model instead of a generic error.
+    status: the HTTP status when the error comes from an HTTP response, else None."""
+    status = None
+
+
+def _http_error(message, status):
+    """An LrError for an HTTP response with this status."""
+    e = LrError(message)
+    e.status = status
+    return e
 
 
 def parse_env(text):
@@ -177,7 +186,7 @@ def _token_request(params):
         with urllib.request.urlopen(req) as r:
             tok = json.load(r)
     except urllib.error.HTTPError as e:
-        raise LrError(f"Token request failed ({e.code}): {e.read().decode()}")
+        raise _http_error(f"Token request failed ({e.code}): {e.read().decode()}", e.code)
     tok["obtained_at"] = int(time.time())
     if "refresh_token" not in tok and TOKEN_FILE.exists():
         # a refresh response may omit refresh_token; keep the existing one
@@ -362,7 +371,7 @@ def get_json(path, auth=True, deadline=None):
     status, body = request("GET", path, auth=auth, deadline=deadline)
     data = parse(body)
     if status != 200:
-        raise LrError(f"GET {path} returned {status}: {data}")
+        raise _http_error(f"GET {path} returned {status}: {data}", status)
     return data
 
 
@@ -448,12 +457,12 @@ def rendition(asset_id, kind):
                          body=b"", content_type="application/octet-stream",
                          headers={"X-Generate-Renditions": kind})
         if gs != 202:
-            raise LrError(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}")
+            raise _http_error(f"Generating the {kind} rendition failed ({gs}): {parse(gb)}", gs)
         for _ in range(30):
             time.sleep(2)
             status, body = request("GET", path)
             if status == 200:
                 break
     if status != 200:
-        raise LrError(f"Rendition {kind} for {asset_id} failed ({status}): {parse(body)}")
+        raise _http_error(f"Rendition {kind} for {asset_id} failed ({status}): {parse(body)}", status)
     return body
